@@ -1,0 +1,45 @@
+{
+  "tenants": {
+    "PRODUCTION": {
+      "db_server": "localhost",
+      "db_name": "VnSampleDB",
+      "db_port": 1433,
+      "db_driver": "ODBC Driver 17 for SQL Server",
+      "db_user": "sa",
+      "db_password": "sa123",
+      "db_trusted_connection": false,
+      "db_encrypt": false,
+      "db_trust_server_cert": false
+    }
+  },
+  "schedule": {
+    "customer_order_recommendation_als": {
+      "enabled": true,
+      "time": "02:00",
+      "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+    },
+    "similar_customers": {
+      "enabled": true,
+      "time": "03:00",
+      "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+    }
+  },
+  "logging": {
+    "default": {
+      "level": "INFO",
+      "format": "json"
+    },
+    "debug": {
+      "level": "DEBUG",
+      "format": "json"
+    },
+    "development": {
+      "level": "DEBUG",
+      "format": "text"
+    }
+  },
+  "conda": {
+    "environment_name": "nSight",
+    "conda_path": ""
+  }
+}
