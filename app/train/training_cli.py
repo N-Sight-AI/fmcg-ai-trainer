@@ -3,13 +3,15 @@
 Command-line interface for FMCG AI Trainer
 
 This script provides a command-line interface for running training jobs
-directly without the API server. It uses the same training registry system.
+directly without the API server. It uses direct module imports for in-process execution.
 """
 
 import argparse
 import sys
 import os
+import importlib
 from datetime import datetime
+from pathlib import Path
 
 # Add the app directory to Python path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -91,7 +93,7 @@ def list_training_types():
         print()
 
 def run_training(tenant: str, training_type: str, dry_run: bool = False):
-    """Run a specific training job."""
+    """Run a specific training job using direct imports (no subprocess)."""
     logger.info(f"Starting training: {training_type} for tenant {tenant}")
     
     if dry_run:
@@ -107,90 +109,60 @@ def run_training(tenant: str, training_type: str, dry_run: bool = False):
     if not registry.validate_script_exists(training_type):
         raise FileNotFoundError(f"Training script not found: {training_config.script_path}")
     
-    # Get command to run
-    try:
-        cmd = registry.get_script_command(training_type, tenant, dry_run)
-        logger.info(f"Running command: {' '.join(cmd)}")
-        
-        # Import and run the training class directly
-        if training_config.class_name:
-            run_training_class(training_config, tenant, dry_run)
-        else:
-            run_training_script(cmd, training_config.script_path)
-            
-    except Exception as e:
-        logger.error(f"Training failed: {str(e)}")
-        raise
+    # Run training using direct class import (no subprocess)
+    if not training_config.class_name:
+        raise ValueError(f"Training type '{training_type}' must have a class_name defined")
+    
+    logger.info(f"Running training class '{training_config.class_name}' from {training_config.script_path}")
+    run_training_class(training_config, tenant, dry_run)
 
 def run_training_class(training_config, tenant: str, dry_run: bool):
-    """Run training using the class-based approach."""
+    """Run training using the class-based approach with direct imports."""
     try:
-        # Import the training module
-        script_dir = os.path.dirname(training_config.script_path)
-        script_name = os.path.basename(training_config.script_path).replace('.py', '')
+        # Get the training module name from script path
+        # e.g., "app/train/customer_order_recommendations_als.py" -> "app.train.customer_order_recommendations_als"
+        script_path = Path(training_config.script_path)
         
-        # Add script directory to path
-        sys.path.insert(0, script_dir)
+        # Convert path to module name
+        # Remove .py extension and convert / to .
+        parts = script_path.with_suffix('').parts
         
-        # Import the module
-        module = __import__(script_name)
+        # Find 'app' in the path and use everything after it
+        try:
+            app_idx = parts.index('app')
+            module_name_parts = parts[app_idx:]
+            module_name = '.'.join(module_name_parts)
+        except ValueError:
+            # Fallback: use the full path relative to current directory
+            module_name = str(script_path.with_suffix('')).replace(os.sep, '.')
+        
+        logger.info(f"Importing training module: {module_name}")
+        
+        # Import the module dynamically using importlib
+        module = importlib.import_module(module_name)
         
         # Get the class
-        if hasattr(module, training_config.class_name):
-            trainer_class = getattr(module, training_config.class_name)
-            
-            # Create trainer instance
-            trainer = trainer_class(tenant)
-            
-            if dry_run:
-                logger.info(f"Dry run: Would train {training_config.display_name} for tenant {tenant}")
-                return
-            
-            # Run training
-            logger.info(f"Starting {training_config.display_name} training for tenant {tenant}")
-            trainer.train_and_export()
-            logger.info(f"Training completed successfully")
-            
-        else:
-            raise AttributeError(f"Class '{training_config.class_name}' not found in {script_name}")
+        if not hasattr(module, training_config.class_name):
+            raise AttributeError(f"Class '{training_config.class_name}' not found in module '{module_name}'")
+        
+        trainer_class = getattr(module, training_config.class_name)
+        
+        if dry_run:
+            logger.info(f"Dry run: Would train {training_config.display_name} for tenant {tenant}")
+            return
+        
+        # Create trainer instance and run training
+        logger.info(f"Starting {training_config.display_name} training for tenant {tenant}")
+        trainer = trainer_class(tenant)
+        trainer.train_and_export()
+        logger.info(f"Training completed successfully")
             
     except Exception as e:
         logger.error(f"Failed to run training class: {str(e)}")
+        import traceback
+        logger.error(f"Traceback:\n{traceback.format_exc()}")
         raise
 
-def run_training_script(cmd, script_path):
-    """Run training using subprocess."""
-    import subprocess
-    
-    try:
-        result = subprocess.run(
-            cmd,
-            cwd=os.path.dirname(script_path),
-            capture_output=True,
-            text=True,
-            env=os.environ.copy()
-        )
-        
-        if result.stdout:
-            logger.info("Training output:")
-            for line in result.stdout.split('\n'):
-                if line.strip():
-                    logger.info(f"  {line}")
-        
-        if result.stderr:
-            logger.error("Training errors:")
-            for line in result.stderr.split('\n'):
-                if line.strip():
-                    logger.error(f"  {line}")
-        
-        if result.returncode != 0:
-            raise RuntimeError(f"Training failed with return code {result.returncode}")
-            
-        logger.info("Training completed successfully")
-        
-    except Exception as e:
-        logger.error(f"Failed to run training script: {str(e)}")
-        raise
 
 if __name__ == "__main__":
     main()

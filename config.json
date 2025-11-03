@@ -1,12 +1,12 @@
 {
   "tenants": {
     "PRODUCTION": {
-      "db_server": "localhost",
-      "db_name": "VnSampleDB",
+      "db_server": "172.46.112.5",
+      "db_name": "nSight",
       "db_port": 1433,
       "db_driver": "ODBC Driver 17 for SQL Server",
-      "db_user": "sa",
-      "db_password": "sa123",
+      "db_user": "AiAdmin",
+      "db_password": "AiAdmin",
       "db_trusted_connection": false,
       "db_encrypt": false,
       "db_trust_server_cert": false

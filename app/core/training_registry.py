@@ -95,7 +95,33 @@ class TrainingRegistry:
         if not self.validate_script_exists(name):
             raise FileNotFoundError(f"Training script not found: {config.script_path}")
         
-        cmd = [sys.executable, config.script_path, "--tenant", tenant]
+        # Get the Python executable to use
+        # If running in EXE (frozen), we need to use the Python executable
+        # from within the EXE, not the EXE itself
+        import sys
+        
+        # Check if we're running in a PyInstaller bundle
+        if getattr(sys, 'frozen', False):
+            # Running as compiled EXE - use embedded Python
+            python_exe = sys.executable
+        else:
+            # Running as Python script - use normal Python
+            python_exe = sys.executable
+        
+        # Check if we should call the training class directly via Python module
+        # Instead of running as subprocess, we can use the CLI module
+        if config.class_name:
+            # Use the training_cli.py module
+            base_path = os.path.dirname(os.path.dirname(__file__))
+            cli_path = os.path.join(base_path, "train", "training_cli.py")
+            if os.path.exists(cli_path):
+                cmd = [python_exe, cli_path, "--tenant", tenant, "--training-type", name]
+                if dry_run:
+                    cmd.append("--dry-run")
+                return cmd
+        
+        # Fallback: run the script directly
+        cmd = [python_exe, config.script_path, "--tenant", tenant]
         if dry_run:
             cmd.append("--dry-run")
         

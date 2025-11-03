@@ -5,10 +5,10 @@ Provides endpoints to trigger and monitor training jobs using the registry syste
 """
 
 import os
-import sys
 import subprocess
 import threading
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Dict, Any, Optional
 from fastapi import APIRouter, HTTPException, BackgroundTasks
 from pydantic import BaseModel
@@ -245,258 +245,6 @@ def start_training_job(tenant: str, training_type: str, dry_run: bool) -> str:
     return job_id
 
 
-@training_router.post("/training/similar-customers", response_model=TrainingResponse)
-def trigger_similar_customers_training(request: TrainingRequest, background_tasks: BackgroundTasks):
-    """
-    Trigger similar customers training job.
-    
-    ## Similar Customers Training
-    
-    This endpoint triggers the ALS-based similar customers training which:
-    - Trains an ALS model on customer-item interactions
-    - Exports customer factors to NSR.als_customer_factors_wide
-    - Exports similar customer relationships to NSR.customer_neighbors_hybrid
-    
-    ### Parameters
-    - **tenant**: Tenant identifier (required)
-    - **dry_run**: Whether to run in dry-run mode (optional, default: false)
-    
-    ### Example Request
-    ```bash
-    curl -X POST "{base_url}/api/v1/training/similar-customers" \\
-         -H "Content-Type: application/json" \\
-         -d '{"tenant": "production", "dry_run": false}'
-    ```
-    
-    ### Response
-    Returns job information including job_id for status tracking.
-    """
-    try:
-        logger.info(f"Starting similar customers training request for tenant: {request.tenant}, dry_run: {request.dry_run}")
-        
-        # Generate unique job ID
-        job_id = f"similar_customers_{request.tenant}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        logger.info(f"Generated job_id: {job_id}")
-        
-        # Initialize job status
-        training_jobs[job_id] = {
-            "job_id": job_id,
-            "status": "queued",
-            "tenant": request.tenant,
-            "training_type": "similar_customers",
-            "dry_run": request.dry_run,
-            "started_at": None,
-            "completed_at": None,
-            "duration_seconds": None,
-            "logs": None,
-            "error": None
-        }
-        
-        # Queue the training job
-        background_tasks.add_task(
-            run_training_script,
-            request.tenant,
-            "similar_customers",
-            request.dry_run,
-            job_id
-        )
-        
-        logger.info(f"Queued similar customers training job {job_id} for tenant {request.tenant}")
-        
-        return TrainingResponse(
-            job_id=job_id,
-            status="queued",
-            message=f"Similar customers training queued for tenant {request.tenant}",
-            tenant=request.tenant,
-            training_type="similar_customers",
-            dry_run=request.dry_run
-        )
-        
-    except Exception as e:
-        logger.error(f"Failed to queue similar customers training: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to queue similar customers training: {str(e)}")
-
-
-@training_router.post("/training/similar-customers/run-direct", response_model=dict)
-def run_similar_customers_training_direct(request: TrainingRequest):
-    """
-    Run similar customers training synchronously and return results.
-    
-    ## Direct Similar Customers Training
-    
-    This endpoint runs the similar customers training synchronously and returns
-    the complete results including logs and execution time.
-    
-    ### Parameters
-    - **tenant**: Tenant identifier (required)
-    - **dry_run**: Whether to run in dry-run mode (optional, default: false)
-    
-    ### Example Request
-    ```bash
-    curl -X POST "{base_url}/api/v1/training/similar-customers/run-direct" \\
-         -H "Content-Type: application/json" \\
-         -d '{"tenant": "production", "dry_run": false}'
-    ```
-    
-    ### Response
-    Returns complete training results including logs and execution metrics.
-    """
-    try:
-        # Verify tenant exists
-        tenant_config = get_tenant_config_from_cache_only(request.tenant)
-        if not tenant_config:
-            raise HTTPException(status_code=404, detail=f"Tenant '{request.tenant}' not found in cache.")
-        
-        # Get training configuration
-        training_config = get_training_config("similar_customers")
-        if not training_config:
-            raise HTTPException(status_code=404, detail="Similar customers training not found in registry")
-        
-        # Get the script command
-        try:
-            cmd = get_training_registry().get_script_command("similar_customers", request.tenant, request.dry_run)
-        except (ValueError, FileNotFoundError) as e:
-            raise HTTPException(status_code=404, detail=str(e))
-        
-        logger.info(f"Starting direct similar customers training: {' '.join(cmd)}")
-        
-        # Run the training script with environment variables
-        env = os.environ.copy()
-        env['PYTHONPATH'] = os.path.dirname(os.path.dirname(os.path.dirname(training_config.script_path)))
-        env['NSIGHT_LOG_LEVEL'] = os.getenv('NSIGHT_LOG_LEVEL', 'INFO')
-        env['NSIGHT_LOG_FORMAT'] = os.getenv('NSIGHT_LOG_FORMAT', 'json')
-        
-        # Pass tenant configuration via environment variables
-        try:
-            tenant_config = get_tenant_config_from_cache_only(request.tenant)
-            if tenant_config:
-                env[f'TENANT_{request.tenant.upper()}_DB_SERVER'] = getattr(tenant_config, "db_server", "")
-                env[f'TENANT_{request.tenant.upper()}_DB_PORT'] = str(getattr(tenant_config, "db_port", 1433))
-                env[f'TENANT_{request.tenant.upper()}_DB_NAME'] = getattr(tenant_config, "db_name", "")
-                env[f'TENANT_{request.tenant.upper()}_DB_DRIVER'] = getattr(tenant_config, "db_driver", "ODBC Driver 17 for SQL Server")
-                if getattr(tenant_config, "db_user", None):
-                    env[f'TENANT_{request.tenant.upper()}_DB_USER'] = tenant_config.db_user
-                if getattr(tenant_config, "db_password", None):
-                    env[f'TENANT_{request.tenant.upper()}_DB_PASSWORD'] = tenant_config.db_password
-                env[f'TENANT_{request.tenant.upper()}_DB_TRUSTED_CONNECTION'] = str(getattr(tenant_config, "db_trusted_connection", False)).lower()
-                env[f'TENANT_{request.tenant.upper()}_DB_ENCRYPT'] = str(getattr(tenant_config, "db_encrypt", True)).lower()
-                env[f'TENANT_{request.tenant.upper()}_DB_TRUST_SERVER_CERT'] = str(getattr(tenant_config, "db_trust_server_cert", True)).lower()
-        except Exception as e:
-            logger.warning(f"Failed to set tenant environment variables: {e}")
-        
-        # Run the training script
-        start_time = datetime.now()
-        result = run_subprocess_with_streaming(cmd, cwd=os.path.dirname(training_config.script_path), env=env)
-        end_time = datetime.now()
-        
-        duration = (end_time - start_time).total_seconds()
-        
-        # Log the results
-        logger.info(f"Similar customers training completed in {duration:.2f} seconds")
-        if result.stdout:
-            logger.info(f"Similar customers training stdout: {result.stdout}")
-        if result.stderr:
-            logger.error(f"Similar customers training stderr: {result.stderr}")
-        
-        # Prepare response
-        response_data = {
-            "status": "success" if result.returncode == 0 else "error",
-            "tenant": request.tenant,
-            "training_type": "similar_customers",
-            "dry_run": request.dry_run,
-            "execution_time_seconds": duration,
-            "return_code": result.returncode,
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-            "started_at": start_time.isoformat(),
-            "completed_at": end_time.isoformat()
-        }
-        
-        if result.returncode != 0:
-            error_msg = f"Similar customers training failed with return code {result.returncode}"
-            if result.stderr:
-                error_msg += f": {result.stderr}"
-            logger.error(error_msg)
-            raise HTTPException(
-                status_code=500,
-                detail=error_msg,
-                headers={"X-Training-Error": "true", "X-Return-Code": str(result.returncode)}
-            )
-        
-        return response_data
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Failed to execute similar customers training: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to execute similar customers training: {str(e)}")
-
-
-@training_router.get("/training/similar-customers/info")
-def get_similar_customers_info():
-    """
-    Get information about similar customers training.
-    
-    ## Similar Customers Training Information
-    
-    This endpoint provides detailed information about the similar customers training
-    including what it does, what data it processes, and what outputs it generates.
-    
-    ### Example Request
-    ```bash
-    curl -X GET "{base_url}/api/v1/training/similar-customers/info"
-    ```
-    
-    ### Response
-    Returns detailed information about the similar customers training process.
-    """
-    try:
-        training_config = get_training_config("similar_customers")
-        if not training_config:
-            raise HTTPException(status_code=404, detail="Similar customers training not found in registry")
-        
-        return {
-            "name": training_config.name,
-            "display_name": training_config.display_name,
-            "description": training_config.description,
-            "enabled": training_config.enabled,
-            "script_exists": get_training_registry().validate_script_exists("similar_customers"),
-            "default_schedule_time": training_config.default_schedule_time,
-            "default_schedule_days": training_config.default_schedule_days,
-            "details": {
-                "purpose": "Train ALS model for similar customer analysis and export customer factors",
-                "input_data": [
-                    "NSR.transactions - Customer transaction history",
-                    "NSR.transaction_lines - Item-level transaction details",
-                    "NSR.customer_attr - Customer attributes (optional)"
-                ],
-                "output_tables": [
-                    "NSR.als_customer_factors_wide - Customer factor vectors (f1-f32, l2_norm)",
-                    "NSR.customer_neighbors_hybrid - Similar customer relationships"
-                ],
-                "algorithm": "Alternating Least Squares (ALS) with implicit feedback",
-                "parameters": {
-                    "K_FACTORS": "Number of latent factors (default: 32)",
-                    "ALS_ITERS": "Number of iterations (default: 25)",
-                    "ALS_REG": "Regularization parameter (default: 0.05)",
-                    "LOOKBACK_DAYS": "Transaction history window (default: 365)",
-                    "ALS_TOP_M_PER_CUSTOMER": "Top M similar customers per customer (default: 100)"
-                },
-                "performance_features": [
-                    "Multi-tier bulk insert optimization",
-                    "BULK INSERT for datasets > 10M records",
-                    "Super-fast method for datasets > 100K records",
-                    "Windows BLAS workaround for compatibility",
-                    "Optimized neighbor computation with adaptive batch sizes"
-                ]
-            }
-        }
-        
-    except Exception as e:
-        logger.error(f"Failed to get similar customers training info: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to get similar customers training info: {str(e)}")
-
-
 @training_router.post("/training/{training_type}", response_model=TrainingResponse)
 def start_training(training_type: str, request: TrainingRequest, background_tasks: BackgroundTasks):
     """
@@ -533,8 +281,11 @@ def start_training(training_type: str, request: TrainingRequest, background_task
             dry_run=request.dry_run
         )
     except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
         logger.error(f"Failed to queue {training_type} training: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to queue training: {str(e)}")
+        logger.error(f"Full traceback:\n{error_details}")
+        raise HTTPException(status_code=500, detail=f"Failed to queue training: {str(e)}\n\nDetails:\n{error_details}")
 
 
 @training_router.get("/training/types")
@@ -577,8 +328,11 @@ def get_training_types():
         }
         
     except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
         logger.error(f"Failed to get training types: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to get training types: {str(e)}")
+        logger.error(f"Full traceback:\n{error_details}")
+        raise HTTPException(status_code=500, detail=f"Failed to get training types: {str(e)}\n\nDetails:\n{error_details}")
 
 
 @training_router.get("/training/status/{job_id}", response_model=TrainingStatusResponse)
@@ -621,8 +375,11 @@ def get_training_status(job_id: str):
     except HTTPException:
         raise
     except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
         logger.error(f"Failed to get training status: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to get training status: {str(e)}")
+        logger.error(f"Full traceback:\n{error_details}")
+        raise HTTPException(status_code=500, detail=f"Failed to get training status: {str(e)}\n\nDetails:\n{error_details}")
 
 
 @training_router.get("/training/jobs")
@@ -674,8 +431,11 @@ def get_training_jobs(
             }
         }
     except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
         logger.error(f"Failed to get training jobs: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to get training jobs: {str(e)}")
+        logger.error(f"Full traceback:\n{error_details}")
+        raise HTTPException(status_code=500, detail=f"Failed to get training jobs: {str(e)}\n\nDetails:\n{error_details}")
 
 
 @training_router.delete("/training/jobs/{job_id}")
@@ -709,12 +469,15 @@ def delete_training_job(job_id: str):
     except HTTPException:
         raise
     except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
         logger.error(f"Failed to delete training job: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to delete training job: {str(e)}")
+        logger.error(f"Full traceback:\n{error_details}")
+        raise HTTPException(status_code=500, detail=f"Failed to delete training job: {str(e)}\n\nDetails:\n{error_details}")
 
 
 @training_router.post("/training/{training_type}/run-direct", response_model=dict)
-def run_training_direct(
+async def run_training_direct(
     training_type: str,
     tenant: str = "production",
     dry_run: bool = False
@@ -758,23 +521,14 @@ def run_training_direct(
         
         logger.info(f"Starting direct training execution: {training_type} for tenant {tenant}")
         
-        # Get the script command from registry
-        try:
-            cmd = get_training_registry().get_script_command(training_type, tenant, dry_run)
-        except (ValueError, FileNotFoundError) as e:
-            raise HTTPException(status_code=404, detail=str(e))
-        
-        logger.info(f"Running command: {' '.join(cmd)}")
-        
-        # Run the training script with environment variables
+        # Set tenant configuration via environment variables
+        import os
         env = os.environ.copy()
-        env['PYTHONPATH'] = os.path.dirname(os.path.dirname(os.path.dirname(training_config.script_path)))
         env['NSIGHT_LOG_LEVEL'] = os.getenv('NSIGHT_LOG_LEVEL', 'INFO')
         env['NSIGHT_LOG_FORMAT'] = os.getenv('NSIGHT_LOG_FORMAT', 'json')
         
         # Pass tenant configuration via environment variables
         try:
-            tenant_config = get_tenant_config_from_cache_only(tenant)
             if tenant_config:
                 env[f'TENANT_{tenant.upper()}_DB_SERVER'] = getattr(tenant_config, "db_server", "")
                 env[f'TENANT_{tenant.upper()}_DB_PORT'] = str(getattr(tenant_config, "db_port", 1433))
@@ -788,321 +542,58 @@ def run_training_direct(
                 env[f'TENANT_{tenant.upper()}_DB_ENCRYPT'] = str(getattr(tenant_config, "db_encrypt", True)).lower()
                 env[f'TENANT_{tenant.upper()}_DB_TRUST_SERVER_CERT'] = str(getattr(tenant_config, "db_trust_server_cert", False)).lower()
         except Exception as e:
-            logger.warning(f"Failed to get tenant config for {tenant}: {e}")
+            logger.warning(f"Failed to set tenant config for {tenant}: {e}")
         
-        # Run the training script directly with proper logging
-        logger.info(f"Executing command: {' '.join(cmd)}")
+        # Import and run training directly (no subprocess!)
+        from app.train.training_cli import run_training
+        import traceback
         
-        process = subprocess.Popen(
-            cmd,
-            cwd=os.path.dirname(training_config.script_path),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            env=env,
-            bufsize=1,
-            universal_newlines=True
-        )
-        
-        stdout_lines = []
-        stderr_lines = []
-        
-        # Wait for process to complete and capture output
-        stdout, stderr = process.communicate()
-        
-        # Log the output
-        if stdout:
-            for line in stdout.splitlines():
-                if line.strip():
-                    stdout_lines.append(line.strip())
-                    logger.info(f"[TRAINING OUTPUT] {line.strip()}")
-        
-        if stderr:
-            for line in stderr.splitlines():
-                if line.strip():
-                    stderr_lines.append(line.strip())
-                    logger.error(f"[TRAINING ERROR] {line.strip()}")
-        
-        final_return_code = process.returncode
-        
-        result = type('Result', (), {
-            'returncode': final_return_code,
-            'stdout': '\n'.join(stdout_lines),
-            'stderr': '\n'.join(stderr_lines)
-        })()
-        
-        # Check result
-        if result.returncode == 0:
-            logger.info(f"Direct training execution completed successfully: {training_type} for tenant {tenant}")
+        start_time = datetime.now()
+        try:
+            # Run training directly in-process (will block, but that's OK)
+            # Run in executor to avoid blocking the event loop completely
+            import asyncio
+            from concurrent.futures import ThreadPoolExecutor
+            
+            loop = asyncio.get_event_loop()
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                await loop.run_in_executor(executor, run_training, tenant, training_type, dry_run)
+            
+            end_time = datetime.now()
+            duration = (end_time - start_time).total_seconds()
+            
+            logger.info(f"Direct training execution completed successfully in {duration:.2f} seconds")
             return {
                 "status": "success",
                 "message": f"Training {training_type} completed successfully for tenant {tenant}",
-                "output": result.stdout,
                 "training_type": training_type,
                 "tenant": tenant,
-                "dry_run": dry_run
+                "dry_run": dry_run,
+                "execution_time_seconds": duration
             }
-        else:
-            logger.error(f"Direct training execution failed: {training_type} for tenant {tenant}")
-            error_message = f"Training {training_type} failed for tenant {tenant}. Error: {result.stderr}"
-            raise HTTPException(
-                status_code=500, 
-                detail=error_message,
-                headers={"X-Training-Output": result.stdout, "X-Training-Return-Code": str(result.returncode)}
-            )
-            
-    except Exception as e:
-        logger.error(f"Direct training execution failed: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Training execution failed: {str(e)}")
-
-
-@training_router.post("/training/similar-customers", response_model=TrainingResponse)
-def trigger_similar_customers_training(request: TrainingRequest, background_tasks: BackgroundTasks):
-    """
-    Trigger similar customers training job.
-    
-    ## Similar Customers Training
-    
-    This endpoint triggers the ALS-based similar customers training which:
-    - Trains an ALS model on customer-item interactions
-    - Exports customer factors to NSR.als_customer_factors_wide
-    - Exports similar customer relationships to NSR.customer_neighbors_hybrid
-    
-    ### Parameters
-    - **tenant**: Tenant identifier (required)
-    - **dry_run**: Whether to run in dry-run mode (optional, default: false)
-    
-    ### Example Request
-    ```bash
-    curl -X POST "{base_url}/api/v1/training/similar-customers" \\
-         -H "Content-Type: application/json" \\
-         -d '{"tenant": "production", "dry_run": false}'
-    ```
-    
-    ### Response
-    Returns job information including job_id for status tracking.
-    """
-    try:
-        logger.info(f"Starting similar customers training request for tenant: {request.tenant}, dry_run: {request.dry_run}")
-        
-        # Generate unique job ID
-        job_id = f"similar_customers_{request.tenant}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        logger.info(f"Generated job_id: {job_id}")
-        
-        # Initialize job status
-        training_jobs[job_id] = {
-            "job_id": job_id,
-            "status": "queued",
-            "tenant": request.tenant,
-            "training_type": "similar_customers",
-            "dry_run": request.dry_run,
-            "started_at": None,
-            "completed_at": None,
-            "duration_seconds": None,
-            "logs": None,
-            "error": None
-        }
-        
-        # Queue the training job
-        background_tasks.add_task(
-            run_training_script,
-            request.tenant,
-            "similar_customers",
-            request.dry_run,
-            job_id
-        )
-        
-        logger.info(f"Queued similar customers training job {job_id} for tenant {request.tenant}")
-        
-        return TrainingResponse(
-            job_id=job_id,
-            status="queued",
-            message=f"Similar customers training queued for tenant {request.tenant}",
-            tenant=request.tenant,
-            training_type="similar_customers",
-            dry_run=request.dry_run
-        )
-        
-    except Exception as e:
-        logger.error(f"Failed to queue similar customers training: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to queue similar customers training: {str(e)}")
-
-
-@training_router.post("/training/similar-customers/run-direct", response_model=dict)
-def run_similar_customers_training_direct(request: TrainingRequest):
-    """
-    Run similar customers training synchronously and return results.
-    
-    ## Direct Similar Customers Training
-    
-    This endpoint runs the similar customers training synchronously and returns
-    the complete results including logs and execution time.
-    
-    ### Parameters
-    - **tenant**: Tenant identifier (required)
-    - **dry_run**: Whether to run in dry-run mode (optional, default: false)
-    
-    ### Example Request
-    ```bash
-    curl -X POST "{base_url}/api/v1/training/similar-customers/run-direct" \\
-         -H "Content-Type: application/json" \\
-         -d '{"tenant": "production", "dry_run": false}'
-    ```
-    
-    ### Response
-    Returns complete training results including logs and execution metrics.
-    """
-    try:
-        # Verify tenant exists
-        tenant_config = get_tenant_config_from_cache_only(request.tenant)
-        if not tenant_config:
-            raise HTTPException(status_code=404, detail=f"Tenant '{request.tenant}' not found in cache.")
-        
-        # Get training configuration
-        training_config = get_training_config("similar_customers")
-        if not training_config:
-            raise HTTPException(status_code=404, detail="Similar customers training not found in registry")
-        
-        # Get the script command
-        try:
-            cmd = get_training_registry().get_script_command("similar_customers", request.tenant, request.dry_run)
-        except (ValueError, FileNotFoundError) as e:
-            raise HTTPException(status_code=404, detail=str(e))
-        
-        logger.info(f"Starting direct similar customers training: {' '.join(cmd)}")
-        
-        # Run the training script with environment variables
-        env = os.environ.copy()
-        env['PYTHONPATH'] = os.path.dirname(os.path.dirname(os.path.dirname(training_config.script_path)))
-        env['NSIGHT_LOG_LEVEL'] = os.getenv('NSIGHT_LOG_LEVEL', 'INFO')
-        env['NSIGHT_LOG_FORMAT'] = os.getenv('NSIGHT_LOG_FORMAT', 'json')
-        
-        # Pass tenant configuration via environment variables
-        try:
-            tenant_config = get_tenant_config_from_cache_only(request.tenant)
-            if tenant_config:
-                env[f'TENANT_{request.tenant.upper()}_DB_SERVER'] = getattr(tenant_config, "db_server", "")
-                env[f'TENANT_{request.tenant.upper()}_DB_PORT'] = str(getattr(tenant_config, "db_port", 1433))
-                env[f'TENANT_{request.tenant.upper()}_DB_NAME'] = getattr(tenant_config, "db_name", "")
-                env[f'TENANT_{request.tenant.upper()}_DB_DRIVER'] = getattr(tenant_config, "db_driver", "ODBC Driver 17 for SQL Server")
-                if getattr(tenant_config, "db_user", None):
-                    env[f'TENANT_{request.tenant.upper()}_DB_USER'] = tenant_config.db_user
-                if getattr(tenant_config, "db_password", None):
-                    env[f'TENANT_{request.tenant.upper()}_DB_PASSWORD'] = tenant_config.db_password
-                env[f'TENANT_{request.tenant.upper()}_DB_TRUSTED_CONNECTION'] = str(getattr(tenant_config, "db_trusted_connection", False)).lower()
-                env[f'TENANT_{request.tenant.upper()}_DB_ENCRYPT'] = str(getattr(tenant_config, "db_encrypt", True)).lower()
-                env[f'TENANT_{request.tenant.upper()}_DB_TRUST_SERVER_CERT'] = str(getattr(tenant_config, "db_trust_server_cert", True)).lower()
         except Exception as e:
-            logger.warning(f"Failed to set tenant environment variables: {e}")
-        
-        # Run the training script
-        start_time = datetime.now()
-        result = run_subprocess_with_streaming(cmd, cwd=os.path.dirname(training_config.script_path), env=env)
-        end_time = datetime.now()
-        
-        duration = (end_time - start_time).total_seconds()
-        
-        # Log the results
-        logger.info(f"Similar customers training completed in {duration:.2f} seconds")
-        if result.stdout:
-            logger.info(f"Similar customers training stdout: {result.stdout}")
-        if result.stderr:
-            logger.error(f"Similar customers training stderr: {result.stderr}")
-        
-        # Prepare response
-        response_data = {
-            "status": "success" if result.returncode == 0 else "error",
-            "tenant": request.tenant,
-            "training_type": "similar_customers",
-            "dry_run": request.dry_run,
-            "execution_time_seconds": duration,
-            "return_code": result.returncode,
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-            "started_at": start_time.isoformat(),
-            "completed_at": end_time.isoformat()
-        }
-        
-        if result.returncode != 0:
-            error_msg = f"Similar customers training failed with return code {result.returncode}"
-            if result.stderr:
-                error_msg += f": {result.stderr}"
-            logger.error(error_msg)
+            error_tb = traceback.format_exc()
+            logger.error("=" * 60)
+            logger.error(f"TRAINING FAILED - {training_type} for tenant {tenant}")
+            logger.error(f"Error: {str(e)}")
+            logger.error(f"Traceback:\n{error_tb}")
+            logger.error("=" * 60)
+            
+            # Raise HTTPException
             raise HTTPException(
                 status_code=500,
-                detail=error_msg,
-                headers={"X-Training-Error": "true", "X-Return-Code": str(result.returncode)}
+                detail=f"Training failed: {str(e)}\n\nTraceback:\n{error_tb}"
             )
-        
-        return response_data
-        
+            
     except HTTPException:
+        # Re-raise HTTPExceptions as-is (these are intentional error responses)
         raise
     except Exception as e:
-        logger.error(f"Failed to execute similar customers training: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to execute similar customers training: {str(e)}")
-
-
-@training_router.get("/training/similar-customers/info")
-def get_similar_customers_info():
-    """
-    Get information about similar customers training.
-    
-    ## Similar Customers Training Information
-    
-    This endpoint provides detailed information about the similar customers training
-    including what it does, what data it processes, and what outputs it generates.
-    
-    ### Example Request
-    ```bash
-    curl -X GET "{base_url}/api/v1/training/similar-customers/info"
-    ```
-    
-    ### Response
-    Returns detailed information about the similar customers training process.
-    """
-    try:
-        training_config = get_training_config("similar_customers")
-        if not training_config:
-            raise HTTPException(status_code=404, detail="Similar customers training not found in registry")
-        
-        return {
-            "name": training_config.name,
-            "display_name": training_config.display_name,
-            "description": training_config.description,
-            "enabled": training_config.enabled,
-            "script_exists": get_training_registry().validate_script_exists("similar_customers"),
-            "default_schedule_time": training_config.default_schedule_time,
-            "default_schedule_days": training_config.default_schedule_days,
-            "details": {
-                "purpose": "Train ALS model for similar customer analysis and export customer factors",
-                "input_data": [
-                    "NSR.transactions - Customer transaction history",
-                    "NSR.transaction_lines - Item-level transaction details",
-                    "NSR.customer_attr - Customer attributes (optional)"
-                ],
-                "output_tables": [
-                    "NSR.als_customer_factors_wide - Customer factor vectors (f1-f32, l2_norm)",
-                    "NSR.customer_neighbors_hybrid - Similar customer relationships"
-                ],
-                "algorithm": "Alternating Least Squares (ALS) with implicit feedback",
-                "parameters": {
-                    "K_FACTORS": "Number of latent factors (default: 32)",
-                    "ALS_ITERS": "Number of iterations (default: 25)",
-                    "ALS_REG": "Regularization parameter (default: 0.05)",
-                    "LOOKBACK_DAYS": "Transaction history window (default: 365)",
-                    "ALS_TOP_M_PER_CUSTOMER": "Top M similar customers per customer (default: 100)"
-                },
-                "performance_features": [
-                    "Multi-tier bulk insert optimization",
-                    "BULK INSERT for datasets > 10M records",
-                    "Super-fast method for datasets > 100K records",
-                    "Windows BLAS workaround for compatibility",
-                    "Optimized neighbor computation with adaptive batch sizes"
-                ]
-            }
-        }
-        
-    except Exception as e:
-        logger.error(f"Failed to get similar customers training info: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to get similar customers training info: {str(e)}")
+        import traceback
+        error_details = traceback.format_exc()
+        logger.error(f"Unexpected error during training execution: {str(e)}")
+        logger.error(f"Full traceback:\n{error_details}")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Unexpected error during training execution: {str(e)}\n\nTraceback:\n{error_details}"
+        )

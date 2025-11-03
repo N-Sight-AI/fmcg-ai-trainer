@@ -1,13 +1,14 @@
-name: nSight
+name: nsight
 channels:
   - conda-forge
   - defaults
 dependencies:
-  - python=3.9
-  - pip
+  - python=3.11
   - numpy>=1.21.0
   - pandas>=1.3.0
   - scipy>=1.7.0
+  - pip
+  - conda-pack>=0.7.0  # For creating portable environments
   - pip:
     - fastapi==0.115.0
     - uvicorn[standard]==0.30.6
@@ -15,3 +16,4 @@ dependencies:
     - implicit>=0.7.0
     - sqlalchemy>=1.4.0
     - pyodbc>=4.0.0
+    - requests

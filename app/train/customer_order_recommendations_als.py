@@ -283,7 +283,9 @@ class ALSTrainer:
             
             try:
                 # Canonical orientation for implicit: items × users
+                self.logger.info(f"Preparing data for training (shape: {X.shape})...")
                 item_user = X.T.tocsr().astype(np.float32)
+                self.logger.info(f"Data prepared, creating ALS model (factors={self.factors}, reg={self.reg}, iters={self.iters})...")
                 
                 # Create and fit the model
                 model = AlternatingLeastSquares(
@@ -292,7 +294,40 @@ class ALSTrainer:
                     iterations=int(self.iters), 
                     use_gpu=bool(use_gpu)
                 )
-                model.fit(item_user, show_progress=False)
+                self.logger.info("Starting model training...")
+                self.logger.info(f"Data matrix shape: {item_user.shape}, nnz: {item_user.nnz}")
+                self.logger.info(f"Matrix is {(item_user.shape[0], item_user.shape[1])} = (items, users)")
+                self.logger.info("About to call model.fit() - this may take a while...")
+                
+                # Flush logs to ensure we see this before hang
+                import sys
+                if hasattr(sys, 'stdout'):
+                    sys.stdout.flush()
+                if hasattr(sys, 'stderr'):
+                    sys.stderr.flush()
+                
+                try:
+                    import time
+                    start_time = time.time()
+                    self.logger.info("Calling model.fit() now...")
+                    
+                    model.fit(item_user, show_progress=False)
+                    
+                    elapsed = time.time() - start_time
+                    self.logger.info(f"model.fit() returned successfully after {elapsed:.2f} seconds")
+                    self.logger.info("Model training completed successfully.")
+                except Exception as fit_error:
+                    self.logger.error(f"model.fit() raised exception: {type(fit_error).__name__}: {str(fit_error)}")
+                    import traceback
+                    self.logger.error(f"Fit traceback:\n{traceback.format_exc()}")
+                    raise
+                return model
+            except Exception as e:
+                self.logger.error(f"Failed to fit ALS model for tenant {self.tenant}: {str(e)}")
+                self.logger.error(f"Error type: {type(e).__name__}")
+                import traceback
+                self.logger.error(f"Traceback:\n{traceback.format_exc()}")
+                raise
             finally:
                 # Restore original threadpoolctl function
                 if original_threadpool_info is not None:
@@ -435,11 +470,23 @@ class ALSTrainer:
             self.logger.info("Step 7: Generating recommendations...")
             
             # Get user factors and normalize
-            user_factors = self.l2_normalize(model.user_factors)
-            item_factors = self.l2_normalize(model.item_factors)
+            # Note: Since we passed X.T to model.fit():
+            # - model.user_factors corresponds to rows of X.T (which are items)
+            # - model.item_factors corresponds to columns of X.T (which are users)
+            # So we need to swap them!
+            user_factors = self.l2_normalize(model.item_factors)  # Users are in item_factors
+            item_factors = self.l2_normalize(model.user_factors)   # Items are in user_factors
             
             # Compute recommendations
+            # user_factors shape: (n_users, factors)
+            # item_factors shape: (n_items, factors)
+            # rec_scores shape: (n_users, n_items)
             rec_scores = user_factors @ item_factors.T
+            
+            # Verify dimensions match
+            self.logger.info(f"rec_scores shape: {rec_scores.shape}, expected: ({len(u_uniques)}, {len(i_uniques)})")
+            assert rec_scores.shape[0] == len(u_uniques), f"User dimension mismatch: {rec_scores.shape[0]} != {len(u_uniques)}"
+            assert rec_scores.shape[1] == len(i_uniques), f"Item dimension mismatch: {rec_scores.shape[1]} != {len(i_uniques)}"
             
             # Create recommendations dataframe using vectorized operations
             self.logger.info(f"Creating recommendations for {len(u_uniques)} users with top-{self.topk} items each...")
@@ -452,13 +499,11 @@ class ALSTrainer:
             
             top_k_indices = np.argpartition(-rec_scores, actual_topk-1, axis=1)[:, :actual_topk]
             
-            # Sort only the top-k items for each user
-            user_indices = np.arange(len(u_uniques))[:, np.newaxis]
-            sorted_indices = np.argsort(-rec_scores[user_indices, top_k_indices], axis=1)
-            top_k_indices = top_k_indices[user_indices, sorted_indices]
-            
-            # Extract scores for top-k items
-            top_k_scores = rec_scores[user_indices, top_k_indices]
+            # Sort only the top-k items for each user by their scores
+            top_k_scores = np.take_along_axis(rec_scores, top_k_indices, axis=1)
+            sorted_inds = np.argsort(-top_k_scores, axis=1)
+            top_k_indices = np.take_along_axis(top_k_indices, sorted_inds, axis=1)
+            top_k_scores = np.take_along_axis(top_k_scores, sorted_inds, axis=1)
             
             # Create arrays for all recommendations at once
             num_recs = len(u_uniques) * actual_topk
