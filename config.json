@@ -37,9 +37,5 @@
       "level": "DEBUG",
       "format": "text"
     }
-  },
-  "conda": {
-    "environment_name": "nSight",
-    "conda_path": ""
   }
 }
