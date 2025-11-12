@@ -1,12 +1,12 @@
 {
   "tenants": {
     "PRODUCTION": {
-      "db_server": "127.0.0.1",
+      "db_server": "172.16.0.251",
       "db_name": "nSight",
-      "db_port": 1433,
+      "db_port": 60446,
       "db_driver": "ODBC Driver 17 for SQL Server",
-      "db_user": "admin",
-      "db_password": "admin",
+      "db_user": "N_Sight",
+      "db_password": "N_$!9t_$q|_SaP",
       "db_trusted_connection": false,
       "db_encrypt": false,
       "db_trust_server_cert": false

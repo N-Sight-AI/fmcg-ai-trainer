@@ -15,6 +15,7 @@ Usage:
 import argparse
 import os
 import sys
+import time
 import traceback
 from datetime import datetime
 from typing import Optional, Dict, Any
@@ -110,7 +111,11 @@ class ALSTrainer:
         try:
             df = pd.read_sql(
                 """
-                SELECT customer_id, item_id, weight
+                SELECT
+                    customer_id,
+                    item_id,
+                    weight,
+                    sales_org_id
                 FROM NSR.vw_interactions
                 WHERE customer_id IS NOT NULL
                   AND item_id IS NOT NULL
@@ -119,14 +124,24 @@ class ALSTrainer:
                   AND TRY_CAST(item_id AS BIGINT) IS NOT NULL
                   AND TRY_CAST(weight AS FLOAT) IS NOT NULL
                   AND weight > 0
-                """, 
+                """,
                 self.engine
             )
             
             df["customer_id"] = pd.to_numeric(df["customer_id"], errors="coerce").astype("Int64")
             df["item_id"] = pd.to_numeric(df["item_id"], errors="coerce").astype("Int64")
             df["weight"] = pd.to_numeric(df["weight"], errors="coerce").astype("float32")
-            df = df.dropna().astype({"customer_id": "int64", "item_id": "int64"})
+            if "sales_org_id" in df.columns:
+                df["sales_org_id"] = pd.to_numeric(df["sales_org_id"], errors="coerce").astype("Int64")
+            else:
+                df["sales_org_id"] = pd.Series([-1] * len(df), dtype="Int64")
+            
+            df = df.dropna(subset=["customer_id", "item_id", "weight"]).astype({
+                "customer_id": "int64",
+                "item_id": "int64",
+                "weight": "float32"
+            })
+            df["sales_org_id"] = df["sales_org_id"].fillna(-1).astype("int64")
             
             if df.empty:
                 raise RuntimeError("vw_interactions returned 0 usable rows.")
@@ -448,6 +463,15 @@ class ALSTrainer:
             # Load data
             self.logger.info("Step 1: Loading interaction data...")
             interactions_df = self.load_interactions()
+            sales_org_lookup = pd.DataFrame(columns=["customer_id", "sales_org_id"])
+            if "sales_org_id" in interactions_df.columns:
+                sales_org_lookup = interactions_df.loc[:, ["customer_id", "sales_org_id"]].copy()
+                # Prefer non-negative sales org ids if available
+                valid_sales_org = sales_org_lookup[sales_org_lookup["sales_org_id"] >= 0]
+                if not valid_sales_org.empty:
+                    sales_org_lookup = valid_sales_org
+                sales_org_lookup = sales_org_lookup.drop_duplicates(subset=["customer_id"], keep="first")
+                sales_org_lookup["sales_org_id"] = sales_org_lookup["sales_org_id"].astype("int64", copy=False)
             
             self.logger.info("Step 2: Loading policy data...")
             policy_df = self.load_policy()
@@ -553,6 +577,15 @@ class ALSTrainer:
                     rec_df = pd.concat([rec_df, backfill_df], ignore_index=True)
                     self.logger.info(f"Added {len(backfill_df)} backfill recommendations")
             
+            # Attach sales organization information
+            if not sales_org_lookup.empty:
+                if "sales_org_id" in rec_df.columns:
+                    rec_df = rec_df.drop(columns=["sales_org_id"])
+                rec_df = rec_df.merge(sales_org_lookup, on="customer_id", how="left")
+            else:
+                rec_df["sales_org_id"] = -1
+            rec_df["sales_org_id"] = rec_df["sales_org_id"].fillna(-1).astype("int64")
+            
             # Normalize scores per user
             self.logger.info("Step 9: Normalizing scores per user...")
             rec_df = self.per_user_norm_excluding_backfill(rec_df)
@@ -595,67 +628,9 @@ class ALSTrainer:
         """Export recommendations to database using ultra-fast bulk operations."""
         try:
             self.logger.info(f"Exporting {len(rec_df)} recommendations to database for tenant {self.tenant}")
-            
-            # Use larger chunk size for bulk operations
-            bulk_chunk_size = min(50000, len(rec_df))  # Larger chunks for bulk operations
-            successful_chunks = 0
-            failed_chunks = 0
-            total_chunks = (len(rec_df) + bulk_chunk_size - 1) // bulk_chunk_size
-            
-            # Get connection once and reuse
-            conn = self.engine.connect()
-            raw_conn = conn.connection.driver_connection
-            cursor = raw_conn.cursor()
-            
-            try:
-                # Enable fast_executemany and other performance optimizations
-                cursor.fast_executemany = True
-                
-                # Truncate table first
-                cursor.execute("TRUNCATE TABLE NSR.user_rec_als")
-                
-                # Prepare bulk insert SQL
-                insert_sql = """
-                    INSERT INTO NSR.user_rec_als 
-                    (customer_id, item_id, als_score_raw, als_score_mm, als_score_rank, source) 
-                    VALUES (?, ?, ?, ?, ?, ?)
-                """
-                
-                # Process data in large chunks
-                for i in range(0, len(rec_df), bulk_chunk_size):
-                    chunk = rec_df.iloc[i:i + bulk_chunk_size]
-                    chunk_num = i // bulk_chunk_size + 1
-                    
-                    for attempt in range(self.max_retries):
-                        try:
-                            # Prepare data for bulk insert - convert to list of tuples for maximum speed
-                            data = [tuple(row) for row in chunk[["customer_id", "item_id", "als_score_raw", "als_score_mm", "als_score_rank", "source"]].values]
-                            
-                            # Bulk insert with fast_executemany
-                            cursor.executemany(insert_sql, data)
-                            raw_conn.commit()
-                            
-                            self.logger.info(f"Chunk {chunk_num}/{total_chunks} exported successfully ({len(chunk)} rows)")
-                            successful_chunks += 1
-                            break
-                        
-                        except Exception as chunk_error:
-                            if attempt < self.max_retries - 1:
-                                self.logger.warning(f"Chunk {chunk_num} failed (attempt {attempt + 1}/{self.max_retries}): {str(chunk_error)}")
-                                import time
-                                time.sleep(2)  # Shorter retry delay for bulk operations
-                            else:
-                                self.logger.error(f"Chunk {chunk_num} failed after {self.max_retries} attempts")
-                                failed_chunks += 1
-                                raise chunk_error
-                
-                self.logger.info(f"Export completed: {successful_chunks} successful chunks, {failed_chunks} failed chunks")
-                
-            finally:
-                # Clean up connections
-                cursor.close()
-                conn.close()
-            
+            initial_chunk = self.chunk_size if self.chunk_size > 0 else 10000
+            initial_chunk = max(2000, min(initial_chunk, len(rec_df), 20000))
+            self._bulk_insert_with_strategy(rec_df, initial_chunk, min_chunk_size=1000, strategy="bulk")
         except Exception as e:
             self.logger.error(f"Failed to export recommendations for tenant {self.tenant}: {str(e)}")
             raise
@@ -665,42 +640,9 @@ class ALSTrainer:
         try:
             self.logger.info(f"Ultra-fast export: {len(rec_df)} recommendations to database for tenant {self.tenant}")
             
-            # Use SQLAlchemy bulk operations for maximum speed
-            from sqlalchemy import text
-            
-            # Get connection
-            conn = self.engine.connect()
-            raw_conn = conn.connection.driver_connection
-            cursor = raw_conn.cursor()
-            
-            try:
-                # Enable all performance optimizations
-                cursor.fast_executemany = True
-                
-                # Truncate table
-                cursor.execute("TRUNCATE TABLE NSR.user_rec_als")
-                
-                # Prepare bulk insert SQL
-                insert_sql = """
-                    INSERT INTO NSR.user_rec_als 
-                    (customer_id, item_id, als_score_raw, als_score_mm, als_score_rank, source) 
-                    VALUES (?, ?, ?, ?, ?, ?)
-                """
-                
-                # Convert DataFrame to list of tuples for maximum speed
-                data = [tuple(row) for row in rec_df[["customer_id", "item_id", "als_score_raw", "als_score_mm", "als_score_rank", "source"]].values]
-                
-                # Single bulk insert for maximum speed
-                self.logger.info(f"Performing single bulk insert of {len(data)} records...")
-                cursor.executemany(insert_sql, data)
-                raw_conn.commit()
-                
-                self.logger.info(f"Ultra-fast export completed: {len(data)} records inserted successfully")
-                
-            finally:
-                cursor.close()
-                conn.close()
-            
+            initial_chunk = self.chunk_size * 2 if self.chunk_size > 0 else 40000
+            initial_chunk = max(2000, min(initial_chunk, len(rec_df), 50000))
+            self._bulk_insert_with_strategy(rec_df, initial_chunk, min_chunk_size=1500, strategy="ultra-fast")
         except Exception as e:
             self.logger.error(f"Ultra-fast export failed for tenant {self.tenant}: {str(e)}")
             # Fallback to regular export method
@@ -712,71 +654,212 @@ class ALSTrainer:
         try:
             self.logger.info(f"Super-fast export: {len(rec_df)} recommendations to database for tenant {self.tenant}")
             
-            # For very large datasets, use optimized chunking with larger chunks
-            super_chunk_size = 200000  # 200K records per chunk for super-fast operations
-            successful_chunks = 0
-            failed_chunks = 0
-            total_chunks = (len(rec_df) + super_chunk_size - 1) // super_chunk_size
-            
-            # Get connection once and reuse
-            conn = self.engine.connect()
-            raw_conn = conn.connection.driver_connection
-            cursor = raw_conn.cursor()
-            
-            try:
-                # Enable all performance optimizations
-                cursor.fast_executemany = True
-                
-                # Truncate table first
-                cursor.execute("TRUNCATE TABLE NSR.user_rec_als")
-                
-                # Prepare bulk insert SQL
-                insert_sql = """
-                    INSERT INTO NSR.user_rec_als 
-                    (customer_id, item_id, als_score_raw, als_score_mm, als_score_rank, source) 
-                    VALUES (?, ?, ?, ?, ?, ?)
-                """
-                
-                # Process data in super-large chunks for maximum efficiency
-                for i in range(0, len(rec_df), super_chunk_size):
-                    chunk = rec_df.iloc[i:i + super_chunk_size]
-                    chunk_num = i // super_chunk_size + 1
-                    
-                    for attempt in range(self.max_retries):
-                        try:
-                            # Convert to list of tuples for maximum speed
-                            data = [tuple(row) for row in chunk[["customer_id", "item_id", "als_score_raw", "als_score_mm", "als_score_rank", "source"]].values]
-                            
-                            # Bulk insert with fast_executemany
-                            cursor.executemany(insert_sql, data)
-                            raw_conn.commit()
-                            
-                            self.logger.info(f"Super-fast chunk {chunk_num}/{total_chunks} exported successfully ({len(chunk)} rows)")
-                            successful_chunks += 1
-                            break
-                            
-                        except Exception as chunk_error:
-                            if attempt < self.max_retries - 1:
-                                self.logger.warning(f"Super-fast chunk {chunk_num} failed (attempt {attempt + 1}/{self.max_retries}): {str(chunk_error)}")
-                                import time
-                                time.sleep(1)  # Very short retry delay for super-fast operations
-                            else:
-                                self.logger.error(f"Super-fast chunk {chunk_num} failed after {self.max_retries} attempts")
-                                failed_chunks += 1
-                                raise chunk_error
-                
-                self.logger.info(f"Super-fast export completed: {successful_chunks} successful chunks, {failed_chunks} failed chunks")
-                
-            finally:
-                # Clean up connections
-                cursor.close()
-                conn.close()
-            
+            initial_chunk = self.chunk_size * 3 if self.chunk_size > 0 else 75000
+            initial_chunk = max(5000, min(initial_chunk, len(rec_df), 100000))
+            self._bulk_insert_with_strategy(rec_df, initial_chunk, min_chunk_size=2500, strategy="super-fast")
         except Exception as e:
             self.logger.error(f"Super-fast export failed for tenant {self.tenant}: {str(e)}")
             # Fallback to ultra-fast export method
             self.logger.info("Falling back to ultra-fast export method...")
             self._export_to_database_ultra_fast(rec_df)
+
+    def _bulk_insert_with_strategy(
+        self,
+        rec_df: pd.DataFrame,
+        initial_chunk_size: int,
+        min_chunk_size: int,
+        strategy: str,
+    ) -> None:
+        """Common bulk insert implementation with adaptive chunk sizing and retry support."""
+        # Ensure sales_org_id column exists before processing
+        if "sales_org_id" not in rec_df.columns:
+            rec_df = rec_df.copy()
+            rec_df["sales_org_id"] = -1
+        else:
+            rec_df = rec_df.copy()
+            rec_df["sales_org_id"] = rec_df["sales_org_id"].fillna(-1)
+
+        columns = [
+            "customer_id",
+            "item_id",
+            "als_score_raw",
+            "als_score_mm",
+            "als_score_rank",
+            "source",
+            "sales_org_id",
+        ]
+        dtype_map = {
+            "customer_id": "int64",
+            "item_id": "int64",
+            "als_score_raw": "float64",
+            "als_score_mm": "float64",
+            "als_score_rank": "float64",
+            "sales_org_id": "int64",
+        }
+
+        min_chunk_size = max(500, min_chunk_size)
+        total_rows = len(rec_df)
+        chunk_size = max(min_chunk_size, min(initial_chunk_size, total_rows)) if total_rows else min_chunk_size
+
+        insert_sql = """
+            INSERT INTO NSR.user_rec_als
+            (customer_id, item_id, als_score_raw, als_score_mm, als_score_rank, source, sales_org_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """
+
+        conn = None
+        cursor = None
+        inserted_rows = 0
+        successful_chunks = 0
+        failed_chunks = 0
+        start_time = time.time()
+
+        try:
+            conn = self.engine.raw_connection()
+            raw_conn = conn
+            raw_conn.autocommit = False
+            cursor = raw_conn.cursor()
+
+            # Enable driver optimisations when available
+            if hasattr(cursor, "fast_executemany"):
+                cursor.fast_executemany = True
+            if hasattr(cursor, "timeout") and self.command_timeout:
+                try:
+                    cursor.timeout = self.command_timeout
+                except Exception:
+                    pass
+            if hasattr(cursor, "arraysize"):
+                cursor.arraysize = chunk_size
+
+            # Always truncate before inserting new recommendations
+            cursor.execute("TRUNCATE TABLE NSR.user_rec_als")
+            raw_conn.commit()
+
+            if total_rows == 0:
+                self.logger.info(f"{strategy.capitalize()} export: no rows to insert after truncate.")
+                return
+
+            position = 0
+            chunk_index = 0
+
+            while position < total_rows:
+                remaining = total_rows - position
+                current_chunk_size = min(chunk_size, remaining)
+                chunk = rec_df.iloc[position: position + current_chunk_size].copy()
+
+                if "sales_org_id" in chunk.columns:
+                    chunk["sales_org_id"] = chunk["sales_org_id"].fillna(-1)
+                else:
+                    chunk["sales_org_id"] = -1
+
+                for col, dtype in dtype_map.items():
+                    chunk[col] = chunk[col].astype(dtype, copy=False)
+                chunk["source"] = chunk["source"].astype(str)
+
+                attempts = 0
+                backoff_seconds = 1.0
+
+                while attempts < self.max_retries:
+                    rows = [tuple(row) for row in chunk[columns].itertuples(index=False, name=None)]
+                    chunk_label = chunk_index + 1
+
+                    try:
+                        begin = time.time()
+                        self.logger.debug(
+                            "%s chunk %s: inserting %s rows (position %s)",
+                            strategy,
+                            chunk_label,
+                            len(rows),
+                            position,
+                        )
+
+                        cursor.executemany(insert_sql, rows)
+                        raw_conn.commit()
+
+                        duration = time.time() - begin
+                        inserted_rows += len(rows)
+                        chunk_index += 1
+                        successful_chunks += 1
+
+                        self.logger.info(
+                            "%s chunk %s committed (%s rows in %.2fs, cumulative %s/%s)",
+                            strategy.capitalize(),
+                            chunk_label,
+                            len(rows),
+                            duration,
+                            inserted_rows,
+                            total_rows,
+                        )
+
+                        position += len(rows)
+                        break
+
+                    except Exception as chunk_error:
+                        raw_conn.rollback()
+                        attempts += 1
+
+                        self.logger.warning(
+                            "%s chunk %s failed on attempt %s/%s with chunk_size=%s: %s",
+                            strategy.capitalize(),
+                            chunk_label,
+                            attempts,
+                            self.max_retries,
+                            len(rows),
+                            chunk_error,
+                        )
+
+                        # Reduce chunk size to alleviate pressure if possible
+                        if chunk_size > min_chunk_size and len(rows) > min_chunk_size:
+                            old_chunk_size = chunk_size
+                            chunk_size = max(min_chunk_size, chunk_size // 2)
+                            self.logger.info(
+                                "%s chunk size reduced from %s to %s rows due to failure; retrying same position %s",
+                                strategy.capitalize(),
+                                old_chunk_size,
+                                chunk_size,
+                                position,
+                            )
+                            current_chunk_size = min(chunk_size, remaining)
+                            chunk = rec_df.iloc[position: position + current_chunk_size].copy()
+                            for col, dtype in dtype_map.items():
+                                chunk[col] = chunk[col].astype(dtype, copy=False)
+                            chunk["source"] = chunk["source"].astype(str)
+                            backoff_seconds = 1.0
+                            # continue with smaller chunk without increasing attempts counter
+                            continue
+
+                        if attempts < self.max_retries:
+                            sleep_time = min(5.0, backoff_seconds)
+                            self.logger.info(
+                                "Retrying %s chunk %s in %.1fs...",
+                                strategy,
+                                chunk_label,
+                                sleep_time,
+                            )
+                            time.sleep(sleep_time)
+                            backoff_seconds = min(5.0, backoff_seconds * 2)
+                        else:
+                            failed_chunks += 1
+                            raise
+
+            raw_conn.commit()
+
+            elapsed = time.time() - start_time
+            self.logger.info(
+                "%s export completed: %s rows inserted in %.2fs (successful chunks=%s, failed chunks=%s, final chunk size=%s).",
+                strategy.capitalize(),
+                inserted_rows,
+                elapsed,
+                successful_chunks,
+                failed_chunks,
+                chunk_size,
+            )
+
+        finally:
+            if cursor is not None:
+                cursor.close()
+            if conn is not None:
+                conn.close()
 
     def _export_to_database_bulk_insert(self, rec_df: pd.DataFrame):
         """Ultimate performance: BULK INSERT using temporary CSV file for millions of records."""
@@ -791,7 +874,7 @@ class ALSTrainer:
                 temp_filename = temp_file.name
                 
                 # Write CSV data directly to file
-                rec_df[["customer_id", "item_id", "als_score_raw", "als_score_mm", "als_score_rank", "source"]].to_csv(
+                rec_df[["customer_id", "item_id", "als_score_raw", "als_score_mm", "als_score_rank", "source", "sales_org_id"]].to_csv(
                     temp_file, 
                     index=False, 
                     header=False,
