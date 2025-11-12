@@ -68,9 +68,14 @@ def get_logger(name: str = None, profile: str = "default"):
         console_handler.setFormatter(formatter)
         logger.addHandler(console_handler)
         
-        # File handler
-        file_handler = logging.FileHandler(log_file)
-        file_handler.setFormatter(formatter)
-        logger.addHandler(file_handler)
+        # File handler (best-effort)
+        try:
+            file_handler = logging.FileHandler(log_file)
+            file_handler.setFormatter(formatter)
+            logger.addHandler(file_handler)
+        except PermissionError as exc:
+            logger.warning("File logging disabled; unable to open %s (%s)", log_file, exc)
+        except OSError as exc:
+            logger.warning("File logging disabled; unable to open %s (%s)", log_file, exc)
     
     return logger
