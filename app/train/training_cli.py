@@ -124,14 +124,15 @@ def run_training_class(training_config, tenant: str, dry_run: bool):
         
         # Convert path to module name
         # Remove .py extension and convert / to .
-        parts = script_path.with_suffix('').parts
+        parts = list(script_path.with_suffix('').parts)
         
-        # Find 'app' in the path and use everything after it
-        try:
-            app_idx = parts.index('app')
+        # Find the last occurrence of 'app' in the path to avoid picking up parent folders like C:\app
+        app_indices = [idx for idx, part in enumerate(parts) if part == 'app']
+        if app_indices:
+            app_idx = app_indices[-1]
             module_name_parts = parts[app_idx:]
             module_name = '.'.join(module_name_parts)
-        except ValueError:
+        else:
             # Fallback: use the full path relative to current directory
             module_name = str(script_path.with_suffix('')).replace(os.sep, '.')
         
