@@ -151,6 +151,24 @@ run_similar_customers.bat
 
 When scheduling, set the Task Scheduler "Program/script" to the full path of the `.bat` file. No additional arguments are required.
 
+#### Prebuilt Task Definitions
+
+Two exported Task Scheduler XML definitions are provided for quick setup:
+
+- `nSight AI Trainer - Order Recommendation ALS.xml`
+- `nSight AI Trainer - Similar Customers.xml`
+
+To use them:
+1. Open **Task Scheduler** → **Action** → **Import Task...**
+2. Select the XML file you want to import
+3. Review and update:
+   - **User account** under the *General* tab (the account must have access to the repo and SQL server)
+   - **Triggers** to match your desired schedule
+   - **Actions** → ensure the **Program/script** path points to the correct `.bat` file in your repo
+4. Save the task
+
+Each XML references the batch script in the project root; adjust the path after import if your directory layout differs.
+
 ### Option 4: Run FastAPI Server
 
 Start the API server:
