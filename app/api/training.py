@@ -317,9 +317,7 @@ def get_training_types():
                 "display_name": config.display_name,
                 "description": config.description,
                 "enabled": config.enabled,
-                "script_exists": registry.validate_script_exists(name),
-                "default_schedule_time": config.default_schedule_time,
-                "default_schedule_days": config.default_schedule_days
+                "script_exists": registry.validate_script_exists(name)
             })
         
         return {

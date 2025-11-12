@@ -88,7 +88,6 @@ def list_training_types():
         print(f"   Name: {config.name}")
         print(f"   Description: {config.description}")
         print(f"   Status: {enabled}")
-        print(f"   Default Schedule: {config.default_schedule_time}")
         print(f"   Script Exists: {registry.validate_script_exists(name)}")
         print()
 

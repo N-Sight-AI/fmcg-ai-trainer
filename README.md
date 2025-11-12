@@ -57,7 +57,7 @@ AI Training API for FMCG recommendations and similar customer analysis.
 
 ## 📝 Configuration
 
-Edit `config.json` to configure your SQL connection and training schedule:
+Edit `config.json` to configure your SQL connection:
 
 ```json
 {
@@ -125,7 +125,7 @@ python main.py
 Or using uvicorn directly:
 
 ```bash
-uvicorn app.main:app --host 0.0.0.0 --port 8003 --reload
+uvicorn app.app:app --host 0.0.0.0 --port 8003 --reload
 ```
 
 The API will be available at:
@@ -133,194 +133,6 @@ The API will be available at:
 - **Swagger Docs**: http://localhost:8003/docs
 - **ReDoc**: http://localhost:8003/redoc
 
-### Option 4: Install as Windows Service (Windows Only)
-
-To run the API as a Windows service that starts automatically:
-
-1. **Install the service:**
-   - Open an elevated Command Prompt (**Run as administrator**)
-   - Navigate to the project directory and use the virtual environment interpreter:
-     ```cmd
-     cd C:\apps\fmcg-ai-trainer-aidin
-     venv\Scripts\python.exe windows_service.py install
-     ```
-   - Alternatively, run the remaining helper script `install_service.bat` as Administrator. It ensures a virtual environment exists, installs dependencies (including `pywin32`), and calls the same command above.
-
-2. **Start the service:**
-   ```cmd
-   net start FMCGAITrainer
-   ```
-   
-   Or use Windows Services Manager:
-   - Press `Win + R`, type `services.msc`, and press Enter
-   - Find "FMCG AI Trainer API Service"
-   - Right-click and select "Start"
-
-3. **Verify the service is running:**
-   ```cmd
-   # Check service status
-   sc query FMCGAITrainer
-   
-   # Or check in Services Manager (services.msc)
-   # Status should show "Running"
-   ```
-
-4. **Test the API:**
-   ```cmd
-   # Test if the API is responding
-   curl http://localhost:8003/docs
-   
-   # Or open in browser:
-   # http://localhost:8003/docs
-   # http://localhost:8003/api/v1/training/status
-   ```
-
-5. **Check service logs:**
-   ```cmd
-   # View the service log file (created on first service run)
-   type logs\service.log
-   
-   # Or open in Notepad
-   notepad logs\service.log
-   ```
-
-6. **Stop the service:**
-   ```cmd
-   net stop FMCGAITrainer
-   ```
-
-7. **Restart the service:**
-   ```cmd
-   net stop FMCGAITrainer
-   net start FMCGAITrainer
-   ```
-
-8. **Uninstall the service:**
-   - Open an elevated Command Prompt and run:
-     ```cmd
-     venv\Scripts\python.exe windows_service.py remove
-     ```
-   - If you prefer a helper script, right-click `uninstall_service.bat` and choose **"Run as administrator"**.
-
-**Service Configuration:**
-- Service Name: `FMCGAITrainer`
-- Display Name: `FMCG AI Trainer API Service`
-- Default Port: `8003` (configurable via `PORT` environment variable)
-- Logs: Written to `logs/service.log`
-
-**Manual pywin32 Installation (if needed):**
-If you prefer to install pywin32 manually before running the installer, make sure you use the same interpreter that will host the service (the project virtual environment):
-```cmd
-venv\Scripts\python.exe -m pip install --upgrade --force-reinstall pywin32
-venv\Scripts\python.exe venv\Scripts\pywin32_postinstall.py -install
-```
-
-**Testing the Service:**
-
-After installation, you can manually verify the service:
-
-```cmd
-# 1. Check service status
-sc query FMCGAITrainer
-
-# 2. Start the service (if not running)
-net start FMCGAITrainer
-
-# 3. Test API in browser
-# Open: http://localhost:8003/docs
-
-# 4. Test API with curl
-curl http://localhost:8003/api/v1/training/status
-
-# 5. Check logs
-type logs\service.log
-```
-
-**Manual Service Management:**
-```cmd
-# Install (ensure you are in an elevated prompt)
-venv\Scripts\python.exe windows_service.py install
-
-# Start
-venv\Scripts\python.exe windows_service.py start
-# or
-net start FMCGAITrainer
-
-# Stop
-venv\Scripts\python.exe windows_service.py stop
-# or
-net stop FMCGAITrainer
-
-# Restart
-net stop FMCGAITrainer && net start FMCGAITrainer
-
-# Remove
-venv\Scripts\python.exe windows_service.py remove
-```
-
-**Troubleshooting the Service:**
-
-**If you get "The service name is invalid" error:**
-
-This means the service is not installed. Check installation:
-
-1. **Verify service installation:**
-   ```cmd
-   # Check if service exists
-   sc query FMCGAITrainer
-   
-   # Optionally remove and reinstall with the commands below.
-   ```
-
-2. **Reinstall the service:**
-   ```cmd
-   # Navigate to project directory
-   cd C:\apps\fmcg-ai-trainer-aidin
-   
-   # Run installer as Administrator
-   venv\Scripts\python.exe windows_service.py remove
-   venv\Scripts\python.exe windows_service.py install
-   ```
-
-3. **Check installation logs:**
-   - Review the output from `install_service.bat`
-   - Look for any error messages during installation
-
-**If the service fails to start:**
-
-1. **Check service status:**
-   ```cmd
-   sc query FMCGAITrainer
-   ```
-
-2. **Check Windows Event Viewer:**
-   - Press `Win + R`, type `eventvwr.msc`
-   - Navigate to: Windows Logs → Application
-   - Look for errors related to "FMCGAITrainer"
-
-3. **Check service logs:**
-   ```cmd
-   type logs\service.log
-   ```
-
-4. **Verify configuration:**
-   - Ensure `config.json` exists and is valid
-   - Check database connection settings
-   - Verify ODBC driver is installed
-
-5. **Test manually:**
-   ```cmd
-   # Activate virtual environment
-   venv\Scripts\activate
-   
-   # Run the app manually to see errors
-   python main.py
-   ```
-
-6. **Run the service in debug mode to surface errors immediately:**
-   ```cmd
-   venv\Scripts\python.exe windows_service.py debug
-   ```
 
 ## 📋 Available Training Types
 
@@ -345,22 +157,12 @@ fmcg-ai-trainer/
 │   ├── core/             # Core training registry
 │   ├── train/            # Training scripts
 │   ├── shared/           # Shared utilities
-│   └── main.py           # FastAPI app
+│   └── app.py            # FastAPI app
 ├── config.json           # Configuration file
 ├── requirements.txt      # Python dependencies
 ├── main.py              # API server entry point
-├── trainer_cli.py       # CLI entry point
-├── windows_service.py    # Windows service wrapper (Windows only)
-├── install_service.bat   # Service installation script (Windows only)
-└── uninstall_service.bat # Service uninstallation script (Windows only)
+└── trainer_cli.py       # CLI entry point
 ```
-
-## 🔧 Helper Scripts (Windows)
-
-- `install_service.bat` – Bootstraps or reuses the virtual environment, installs dependencies, and registers the Windows service via `venv\Scripts\python.exe windows_service.py install`.
-- `uninstall_service.bat` – Removes the registered Windows service via the virtual environment interpreter.
-
-All other batch helpers have been removed. Use the commands documented above (`venv\Scripts\python.exe windows_service.py ...`, `net start`, `net stop`, etc.) for additional service management tasks.
 
 ## 🔧 Development
 
@@ -392,22 +194,5 @@ pyodbc.InterfaceError: ('IM002', '[IM002] [Microsoft][ODBC Driver Manager] Data 
 ## 📝 Notes
 
 - The application uses environment variables for configuration, with `config.json` as a fallback
-- Runtime logs are written into the `logs/` directory (ignored by Git) when the Windows service is active
+- Runtime logs are written into the `logs/` directory (ignored by Git) when configured in the application
 - Training jobs can be run independently of the API server
-
-### Windows Service: `pythonservice.exe` Missing
-
-If `win32serviceutil` reports an error similar to:
-
-```
-RuntimeError: Can't find 'C:\...\pythonservice.exe'
-```
-
-It means the service installer is using a different interpreter than the one that has `pywin32`. Ensure you install/start the service with `venv\Scripts\python.exe`. If the error persists:
-
-1. Reinstall pywin32 inside the virtual environment:
-   ```cmd
-   venv\Scripts\python.exe -m pip install --upgrade --force-reinstall pywin32
-   venv\Scripts\python.exe venv\Scripts\pywin32_postinstall.py -install
-   ```
-2. Confirm `pythonservice.exe` exists in `venv\` (created automatically after the step above).

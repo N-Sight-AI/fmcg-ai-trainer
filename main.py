@@ -14,7 +14,7 @@ if __name__ == "__main__":
     reload = os.getenv("ENV", "production") == "development"
     
     uvicorn.run(
-        "app.main:app",
+        "app.app:app",
         host="0.0.0.0",
         port=int(os.getenv("PORT", "8003")),
         reload=reload,

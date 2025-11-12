@@ -6,9 +6,8 @@ and their configurations. It allows easy addition of new training types
 without modifying the core API code.
 """
 
-from typing import Dict, List, Optional, Any
+from typing import Dict, Optional, List
 from dataclasses import dataclass
-from datetime import datetime, timezone
 import os
 import sys
 
@@ -21,12 +20,6 @@ class TrainingConfig:
     class_name: Optional[str] = None
     description: str = ""
     enabled: bool = True
-    default_schedule_time: str = "02:00"
-    default_schedule_days: List[str] = None
-    
-    def __post_init__(self):
-        if self.default_schedule_days is None:
-            self.default_schedule_days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 
 class TrainingRegistry:
     """Registry for managing training configurations."""
@@ -45,8 +38,7 @@ class TrainingRegistry:
             display_name="Customer Order Recommendation ALS",
             script_path=os.path.join(base_path, "train", "customer_order_recommendations_als.py"),
             class_name="ALSTrainer",
-            description="Train ALS model for customer order recommendations using customer-item interactions",
-            default_schedule_time="02:00"
+            description="Train ALS model for customer order recommendations using customer-item interactions"
         ))
         
         # Similar Customers Training
@@ -55,8 +47,7 @@ class TrainingRegistry:
             display_name="Similar Customers",
             script_path=os.path.join(base_path, "train", "train_als_export_similar_customer.py"),
             class_name="ALSTrainer",
-            description="Train ALS model for similar customer analysis",
-            default_schedule_time="03:00"
+            description="Train ALS model for similar customer analysis"
         ))
     
     def register(self, config: TrainingConfig):

@@ -12,18 +12,6 @@
       "db_trust_server_cert": false
     }
   },
-  "schedule": {
-    "customer_order_recommendation_als": {
-      "enabled": true,
-      "time": "02:00",
-      "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-    },
-    "similar_customers": {
-      "enabled": true,
-      "time": "03:00",
-      "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-    }
-  },
   "logging": {
     "default": {
       "level": "INFO",
