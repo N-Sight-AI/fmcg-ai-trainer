@@ -13,6 +13,7 @@
     }
   },
   "logging": {
+    "clean_logs_on_run": false,
     "default": {
       "level": "INFO",
       "format": "json"

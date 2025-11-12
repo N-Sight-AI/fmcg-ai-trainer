@@ -87,6 +87,22 @@ export TENANT_PRODUCTION_DB_PASSWORD=your_password
 export TENANT_PRODUCTION_DB_TRUSTED_CONNECTION=false
 ```
 
+### Optional: Log Cleanup
+
+To clear the `logs/` directory at the beginning of each run, set the flag in `config.json`:
+
+```json
+"logging": {
+  "clean_logs_on_run": true,
+  "default": {
+    "level": "INFO",
+    "format": "json"
+  }
+}
+```
+
+When `clean_logs_on_run` is `false` (the default), existing log files are preserved.
+
 ## 🏃 Running the Application
 
 ### Option 1: Run Training via CLI
@@ -114,7 +130,28 @@ python -m app.train.training_cli --tenant PRODUCTION --training-type customer_or
 python -m app.train.training_cli --list-types
 ```
 
-### Option 3: Run FastAPI Server
+### Option 3 (Windows): Scheduled Batch Scripts
+
+If you prefer using Windows Task Scheduler, two helper scripts are included:
+
+- `run_customer_order_recommendation_als.bat`
+- `run_similar_customers.bat`
+
+Both scripts:
+- Activate the project's virtual environment (`venv\Scripts\python.exe`)
+- Invoke `trainer_cli.py` with the proper training type
+- Exit with the training command's status code so Task Scheduler can detect failures
+
+To test interactively:
+
+```cmd
+run_customer_order_recommendation_als.bat
+run_similar_customers.bat
+```
+
+When scheduling, set the Task Scheduler "Program/script" to the full path of the `.bat` file. No additional arguments are required.
+
+### Option 4: Run FastAPI Server
 
 Start the API server:
 

@@ -1,5 +1,31 @@
-import logging, os
-from .tenant_utils import get_logging_config
+import logging
+import os
+import shutil
+from .tenant_utils import get_logging_config, should_clean_logs_on_run
+
+_LOGS_CLEANED = False
+
+
+def clean_logs_if_enabled(log_dir: str):
+    """Remove existing logs when configured to do so."""
+    global _LOGS_CLEANED
+    if _LOGS_CLEANED:
+        return
+    
+    clean_logs = should_clean_logs_on_run()
+    if clean_logs and os.path.isdir(log_dir):
+        for entry in os.listdir(log_dir):
+            entry_path = os.path.join(log_dir, entry)
+            try:
+                if os.path.isfile(entry_path) or os.path.islink(entry_path):
+                    os.remove(entry_path)
+                else:
+                    shutil.rmtree(entry_path)
+            except Exception:
+                # Best-effort cleanup; ignore permission errors
+                pass
+    
+    _LOGS_CLEANED = True
 
 def get_logger(name: str = None, profile: str = "default"):
     # Try to get logging config from config.json, fallback to environment variables
@@ -21,6 +47,7 @@ def get_logger(name: str = None, profile: str = "default"):
     # Create logs directory if it doesn't exist
     # Use the project root logs directory
     log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))), "logs")
+    clean_logs_if_enabled(log_dir)
     os.makedirs(log_dir, exist_ok=True)
     
     # Set up file logging

@@ -25,7 +25,7 @@ from sqlalchemy import create_engine, text
 # Add the project root to the Python path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
 
-from app.shared.common.tracing import get_logger
+from app.shared.common.tracing import get_logger, clean_logs_if_enabled
 
 # Setup logging for this script using environment variables
 log_level = os.getenv('NSIGHT_LOG_LEVEL', 'INFO')
@@ -39,6 +39,7 @@ from datetime import datetime
 
 # Create logs directory in project root (must resolve __file__ first to get absolute path)
 log_dir = Path(__file__).resolve().parent.parent.parent.parent.parent / "logs"
+clean_logs_if_enabled(str(log_dir))
 log_dir.mkdir(exist_ok=True)
 
 # Setup custom logger for training
