@@ -132,16 +132,16 @@ class ALSTrainer:
             df["item_id"] = pd.to_numeric(df["item_id"], errors="coerce").astype("Int64")
             df["weight"] = pd.to_numeric(df["weight"], errors="coerce").astype("float32")
             if "sales_org_id" in df.columns:
-                df["sales_org_id"] = pd.to_numeric(df["sales_org_id"], errors="coerce").astype("Int64")
+                df["sales_org_id"] = df["sales_org_id"].astype(str)
             else:
-                df["sales_org_id"] = pd.Series([-1] * len(df), dtype="Int64")
+                df["sales_org_id"] = "-1"
             
             df = df.dropna(subset=["customer_id", "item_id", "weight"]).astype({
                 "customer_id": "int64",
                 "item_id": "int64",
                 "weight": "float32"
             })
-            df["sales_org_id"] = df["sales_org_id"].fillna(-1).astype("int64")
+            df["sales_org_id"] = df["sales_org_id"].fillna("-1").astype(str)
             
             if df.empty:
                 raise RuntimeError("vw_interactions returned 0 usable rows.")
@@ -186,11 +186,27 @@ class ALSTrainer:
         try:
             df = pd.read_sql(
                 """
-                SELECT customer_id, item_id, days_since_last, med_cycle_days, avg_cycle_days
+                SELECT customer_id,
+                       item_id,
+                       days_since_last,
+                       med_cycle_days,
+                       avg_cycle_days,
+                       sales_org_id
                 FROM NSR.customer_item_reorder_stats
-                """, 
+                """,
                 self.engine
-            ).astype({"customer_id": "int64", "item_id": "int64"})
+            )
+            df["customer_id"] = pd.to_numeric(df["customer_id"], errors="coerce").astype("Int64")
+            df["item_id"] = pd.to_numeric(df["item_id"], errors="coerce").astype("Int64")
+            df["days_since_last"] = pd.to_numeric(df["days_since_last"], errors="coerce")
+            df["med_cycle_days"] = pd.to_numeric(df["med_cycle_days"], errors="coerce")
+            df["avg_cycle_days"] = pd.to_numeric(df["avg_cycle_days"], errors="coerce")
+            if "sales_org_id" in df.columns:
+                df["sales_org_id"] = df["sales_org_id"].astype(str)
+            else:
+                df["sales_org_id"] = "-1"
+            df = df.dropna(subset=["customer_id", "item_id"]).astype({"customer_id": "int64", "item_id": "int64"})
+            df["sales_org_id"] = df["sales_org_id"].fillna("-1").astype(str)
             
             self.logger.info(f"Loaded {len(df)} reorder stats for tenant {self.tenant}")
             return df
@@ -236,7 +252,11 @@ class ALSTrainer:
     def build_matrix(self, df: pd.DataFrame):
         """Build interaction matrix from dataframe."""
         try:
-            u_codes, u_uniques = pd.factorize(df["customer_id"].values, sort=True)
+            df = df.copy()
+            df["sales_org_id"] = df["sales_org_id"].astype(str)
+            df["customer_key"] = df["customer_id"].astype(str) + "|" + df["sales_org_id"]
+            
+            u_codes, u_uniques = pd.factorize(df["customer_key"].values, sort=True)
             i_codes, i_uniques = pd.factorize(df["item_id"].values, sort=True)
             
             X = coo_matrix(
@@ -402,7 +422,9 @@ class ALSTrainer:
                                         min_span=1e-4, rank_blend=0.30) -> pd.DataFrame:
         """Normalize ALS scores per user with robust min-max scaling."""
         df = df.copy()
+        df["sales_org_id"] = df["sales_org_id"].astype(str)
         df["als_score_mm"] = 0.0
+        group_cols = ["customer_id", "sales_org_id"]
         
         # Handle backfill recommendations first
         backfill_mask = df["source"] == "backfill"
@@ -413,43 +435,62 @@ class ALSTrainer:
         if not als_mask.any():
             return df
         
-        # Calculate group sizes for each customer
-        customer_counts = df[als_mask]["customer_id"].value_counts()
+        # Calculate group sizes for each customer/sales_org pair
+        counts_df = (
+            df.loc[als_mask, group_cols]
+            .assign(_count=1)
+            .groupby(group_cols)["_count"]
+            .sum()
+            .rename("customer_item_count")
+            .reset_index()
+        )
+        df = df.merge(counts_df, on=group_cols, how="left")
+        df["customer_item_count"] = df["customer_item_count"].fillna(0)
         
         # Handle customers with few items (rank-based normalization)
-        customers_with_few_items = customer_counts[customer_counts < min_items].index
-        few_items_mask = als_mask & df["customer_id"].isin(customers_with_few_items)
+        few_items_mask = als_mask & (df["customer_item_count"] < min_items)
+        denom_few = np.maximum(df.loc[few_items_mask, "customer_item_count"] - 1, 1)
         if few_items_mask.any():
-            df.loc[few_items_mask, "als_score_mm"] = 1.0 - (df.loc[few_items_mask, "als_score_rank"] - 1) / (customer_counts[df.loc[few_items_mask, "customer_id"]] - 1).values
+            df.loc[few_items_mask, "als_score_mm"] = (
+                1.0 - (df.loc[few_items_mask, "als_score_rank"] - 1) / denom_few
+            )
         
         # Handle customers with sufficient items (robust min-max normalization)
-        sufficient_items_mask = als_mask & ~df["customer_id"].isin(customers_with_few_items)
+        sufficient_items_mask = als_mask & ~few_items_mask
         if sufficient_items_mask.any():
-            # Calculate quantiles per customer
-            quantile_df = df[sufficient_items_mask].groupby("customer_id")["als_score_raw"].quantile([lo/100, hi/100]).unstack()
-            quantile_df.columns = ['lo_val', 'hi_val']
-            quantile_df['span'] = quantile_df['hi_val'] - quantile_df['lo_val']
+            quantile_df = (
+                df.loc[sufficient_items_mask]
+                .groupby(group_cols)["als_score_raw"]
+                .quantile([lo / 100, hi / 100])
+                .unstack()
+                .rename(columns={lo / 100: "lo_val", hi / 100: "hi_val"})
+            )
+            quantile_df["span"] = quantile_df["hi_val"] - quantile_df["lo_val"]
             
-            # Merge quantiles back to main dataframe
-            df = df.merge(quantile_df, left_on="customer_id", right_index=True, how="left")
+            df = df.merge(quantile_df, on=group_cols, how="left")
             
-            # Determine normalization strategy
             span_too_small_mask = sufficient_items_mask & (df["span"] < min_span)
-            minmax_mask = sufficient_items_mask & (df["span"] >= min_span)
-            
-            # Handle span too small (rank-based normalization)
             if span_too_small_mask.any():
-                df.loc[span_too_small_mask, "als_score_mm"] = 1.0 - (df.loc[span_too_small_mask, "als_score_rank"] - 1) / (customer_counts[df.loc[span_too_small_mask, "customer_id"]] - 1).values
+                denom_small = np.maximum(df.loc[span_too_small_mask, "customer_item_count"] - 1, 1)
+                df.loc[span_too_small_mask, "als_score_mm"] = (
+                    1.0 - (df.loc[span_too_small_mask, "als_score_rank"] - 1) / denom_small
+                )
             
-            # Handle min-max normalization with rank blending
+            minmax_mask = sufficient_items_mask & (df["span"] >= min_span)
             if minmax_mask.any():
-                minmax_scores = np.clip((df.loc[minmax_mask, "als_score_raw"] - df.loc[minmax_mask, "lo_val"]) / df.loc[minmax_mask, "span"], 0, 1)
-                rank_scores = 1.0 - (df.loc[minmax_mask, "als_score_rank"] - 1) / (customer_counts[df.loc[minmax_mask, "customer_id"]] - 1).values
+                minmax_scores = np.clip(
+                    (df.loc[minmax_mask, "als_score_raw"] - df.loc[minmax_mask, "lo_val"])
+                    / df.loc[minmax_mask, "span"],
+                    0,
+                    1,
+                )
+                denom_minmax = np.maximum(df.loc[minmax_mask, "customer_item_count"] - 1, 1)
+                rank_scores = 1.0 - (df.loc[minmax_mask, "als_score_rank"] - 1) / denom_minmax
                 df.loc[minmax_mask, "als_score_mm"] = (1 - rank_blend) * minmax_scores + rank_blend * rank_scores
             
-            # Clean up temporary columns
-            df = df.drop(columns=['lo_val', 'hi_val', 'span'], errors='ignore')
+            df = df.drop(columns=["lo_val", "hi_val", "span"], errors="ignore")
         
+        df = df.drop(columns=["customer_item_count"], errors="ignore")
         return df
     
     def train_and_export(self):
@@ -463,15 +504,10 @@ class ALSTrainer:
             # Load data
             self.logger.info("Step 1: Loading interaction data...")
             interactions_df = self.load_interactions()
-            sales_org_lookup = pd.DataFrame(columns=["customer_id", "sales_org_id"])
-            if "sales_org_id" in interactions_df.columns:
-                sales_org_lookup = interactions_df.loc[:, ["customer_id", "sales_org_id"]].copy()
-                # Prefer non-negative sales org ids if available
-                valid_sales_org = sales_org_lookup[sales_org_lookup["sales_org_id"] >= 0]
-                if not valid_sales_org.empty:
-                    sales_org_lookup = valid_sales_org
-                sales_org_lookup = sales_org_lookup.drop_duplicates(subset=["customer_id"], keep="first")
-                sales_org_lookup["sales_org_id"] = sales_org_lookup["sales_org_id"].astype("int64", copy=False)
+            interactions_df["sales_org_id"] = interactions_df["sales_org_id"].fillna("-1").astype(str)
+            interactions_df["customer_sales_org_key"] = (
+                interactions_df["customer_id"].astype(str) + "|" + interactions_df["sales_org_id"]
+            )
             
             self.logger.info("Step 2: Loading policy data...")
             policy_df = self.load_policy()
@@ -484,7 +520,10 @@ class ALSTrainer:
             
             # Build interaction matrix
             self.logger.info("Step 5: Building interaction matrix...")
-            X, u_uniques, i_uniques = self.build_matrix(interactions_df)
+            matrix_input_df = interactions_df[["customer_sales_org_key", "item_id", "weight"]].rename(
+                columns={"customer_sales_org_key": "customer_id"}
+            )
+            X, u_uniques, i_uniques = self.build_matrix(matrix_input_df)
             
             # Fit ALS model
             self.logger.info("Step 6: Training ALS model...")
@@ -531,7 +570,10 @@ class ALSTrainer:
             
             # Create arrays for all recommendations at once
             num_recs = len(u_uniques) * actual_topk
-            customer_ids = np.repeat(u_uniques, actual_topk)
+            customer_keys = np.repeat(np.asarray(u_uniques, dtype=str), actual_topk)
+            partitioned_keys = np.char.partition(customer_keys, "|")
+            customer_ids = partitioned_keys[:, 0].astype(np.int64)
+            sales_org_ids = np.where(partitioned_keys[:, 1] == "", "-1", partitioned_keys[:, 2])
             item_ids = i_uniques[top_k_indices.flatten()]
             scores = top_k_scores.flatten()
             ranks = np.tile(np.arange(1, actual_topk + 1), len(u_uniques))
@@ -539,33 +581,40 @@ class ALSTrainer:
             # Create DataFrame directly from arrays
             rec_df = pd.DataFrame({
                 "customer_id": customer_ids,
+                "sales_org_id": sales_org_ids,
                 "item_id": item_ids,
                 "als_score_raw": scores.astype(float),
                 "als_score_rank": ranks,
                 "source": "als"
             })
+            rec_df["sales_org_id"] = rec_df["sales_org_id"].astype(str)
             
             self.logger.info(f"Generated {len(rec_df)} ALS recommendations")
             
             # Add backfill recommendations for customers with few ALS recommendations
             self.logger.info("Step 8: Adding backfill recommendations...")
-            customer_counts = rec_df.groupby("customer_id").size()
-            customers_needing_backfill = customer_counts[customer_counts < 10].index
+            customer_counts = rec_df.groupby(["customer_id", "sales_org_id"]).size()
+            customers_needing_backfill = customer_counts[customer_counts < 10]
             
-            if len(customers_needing_backfill) > 0:
-                self.logger.info(f"Adding backfill recommendations for {len(customers_needing_backfill)} customers")
+            if not customers_needing_backfill.empty:
+                self.logger.info(f"Adding backfill recommendations for {len(customers_needing_backfill)} customer/sales_org pairs")
                 
                 # Get items that are due for reorder
-                due_items = reorder_stats_df[reorder_stats_df.apply(self.is_due, axis=1)]
+                due_items = reorder_stats_df[reorder_stats_df.apply(self.is_due, axis=1)].copy()
+                due_items["sales_org_id"] = due_items["sales_org_id"].astype(str)
                 
                 # Vectorized backfill approach
                 backfill_recs = []
-                for customer_id in customers_needing_backfill:
-                    customer_due_items = due_items[due_items["customer_id"] == customer_id]
+                for (customer_id, sales_org_id), _ in customers_needing_backfill.items():
+                    customer_due_items = due_items[
+                        (due_items["customer_id"] == customer_id) &
+                        (due_items["sales_org_id"] == sales_org_id)
+                    ]
                     if len(customer_due_items) > 0:
                         top_items = customer_due_items.head(10)
                         backfill_recs.append(pd.DataFrame({
                             "customer_id": customer_id,
+                            "sales_org_id": sales_org_id,
                             "item_id": top_items["item_id"].values,
                             "als_score_raw": 0.0,
                             "als_score_rank": 999,
@@ -578,14 +627,6 @@ class ALSTrainer:
                     self.logger.info(f"Added {len(backfill_df)} backfill recommendations")
             
             # Attach sales organization information
-            if not sales_org_lookup.empty:
-                if "sales_org_id" in rec_df.columns:
-                    rec_df = rec_df.drop(columns=["sales_org_id"])
-                rec_df = rec_df.merge(sales_org_lookup, on="customer_id", how="left")
-            else:
-                rec_df["sales_org_id"] = -1
-            rec_df["sales_org_id"] = rec_df["sales_org_id"].fillna(-1).astype("int64")
-            
             # Normalize scores per user
             self.logger.info("Step 9: Normalizing scores per user...")
             rec_df = self.per_user_norm_excluding_backfill(rec_df)
@@ -674,10 +715,10 @@ class ALSTrainer:
         # Ensure sales_org_id column exists before processing
         if "sales_org_id" not in rec_df.columns:
             rec_df = rec_df.copy()
-            rec_df["sales_org_id"] = -1
+            rec_df["sales_org_id"] = "-1"
         else:
             rec_df = rec_df.copy()
-            rec_df["sales_org_id"] = rec_df["sales_org_id"].fillna(-1)
+            rec_df["sales_org_id"] = rec_df["sales_org_id"].fillna("-1").astype(str)
 
         columns = [
             "customer_id",
@@ -694,7 +735,6 @@ class ALSTrainer:
             "als_score_raw": "float64",
             "als_score_mm": "float64",
             "als_score_rank": "float64",
-            "sales_org_id": "int64",
         }
 
         min_chunk_size = max(500, min_chunk_size)
@@ -748,9 +788,9 @@ class ALSTrainer:
                 chunk = rec_df.iloc[position: position + current_chunk_size].copy()
 
                 if "sales_org_id" in chunk.columns:
-                    chunk["sales_org_id"] = chunk["sales_org_id"].fillna(-1)
+                    chunk["sales_org_id"] = chunk["sales_org_id"].fillna("-1").astype(str)
                 else:
-                    chunk["sales_org_id"] = -1
+                    chunk["sales_org_id"] = "-1"
 
                 for col, dtype in dtype_map.items():
                     chunk[col] = chunk[col].astype(dtype, copy=False)
@@ -821,6 +861,10 @@ class ALSTrainer:
                             )
                             current_chunk_size = min(chunk_size, remaining)
                             chunk = rec_df.iloc[position: position + current_chunk_size].copy()
+                            if "sales_org_id" in chunk.columns:
+                                chunk["sales_org_id"] = chunk["sales_org_id"].fillna("-1").astype(str)
+                            else:
+                                chunk["sales_org_id"] = "-1"
                             for col, dtype in dtype_map.items():
                                 chunk[col] = chunk[col].astype(dtype, copy=False)
                             chunk["source"] = chunk["source"].astype(str)
