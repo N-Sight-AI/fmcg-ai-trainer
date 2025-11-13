@@ -15,6 +15,7 @@ Usage:
 import argparse
 import os
 import sys
+import time
 import traceback
 from datetime import datetime
 from typing import Optional, Dict, Any
@@ -110,7 +111,11 @@ class ALSTrainer:
         try:
             df = pd.read_sql(
                 """
-                SELECT customer_id, item_id, weight
+                SELECT
+                    customer_id,
+                    item_id,
+                    weight,
+                    sales_org_id
                 FROM NSR.vw_interactions
                 WHERE customer_id IS NOT NULL
                   AND item_id IS NOT NULL
@@ -119,14 +124,24 @@ class ALSTrainer:
                   AND TRY_CAST(item_id AS BIGINT) IS NOT NULL
                   AND TRY_CAST(weight AS FLOAT) IS NOT NULL
                   AND weight > 0
-                """, 
+                """,
                 self.engine
             )
             
             df["customer_id"] = pd.to_numeric(df["customer_id"], errors="coerce").astype("Int64")
             df["item_id"] = pd.to_numeric(df["item_id"], errors="coerce").astype("Int64")
             df["weight"] = pd.to_numeric(df["weight"], errors="coerce").astype("float32")
-            df = df.dropna().astype({"customer_id": "int64", "item_id": "int64"})
+            if "sales_org_id" in df.columns:
+                df["sales_org_id"] = df["sales_org_id"].astype(str)
+            else:
+                df["sales_org_id"] = "-1"
+            
+            df = df.dropna(subset=["customer_id", "item_id", "weight"]).astype({
+                "customer_id": "int64",
+                "item_id": "int64",
+                "weight": "float32"
+            })
+            df["sales_org_id"] = df["sales_org_id"].fillna("-1").astype(str)
             
             if df.empty:
                 raise RuntimeError("vw_interactions returned 0 usable rows.")
@@ -171,11 +186,27 @@ class ALSTrainer:
         try:
             df = pd.read_sql(
                 """
-                SELECT customer_id, item_id, days_since_last, med_cycle_days, avg_cycle_days
+                SELECT customer_id,
+                       item_id,
+                       days_since_last,
+                       med_cycle_days,
+                       avg_cycle_days,
+                       sales_org_id
                 FROM NSR.customer_item_reorder_stats
-                """, 
+                """,
                 self.engine
-            ).astype({"customer_id": "int64", "item_id": "int64"})
+            )
+            df["customer_id"] = pd.to_numeric(df["customer_id"], errors="coerce").astype("Int64")
+            df["item_id"] = pd.to_numeric(df["item_id"], errors="coerce").astype("Int64")
+            df["days_since_last"] = pd.to_numeric(df["days_since_last"], errors="coerce")
+            df["med_cycle_days"] = pd.to_numeric(df["med_cycle_days"], errors="coerce")
+            df["avg_cycle_days"] = pd.to_numeric(df["avg_cycle_days"], errors="coerce")
+            if "sales_org_id" in df.columns:
+                df["sales_org_id"] = df["sales_org_id"].astype(str)
+            else:
+                df["sales_org_id"] = "-1"
+            df = df.dropna(subset=["customer_id", "item_id"]).astype({"customer_id": "int64", "item_id": "int64"})
+            df["sales_org_id"] = df["sales_org_id"].fillna("-1").astype(str)
             
             self.logger.info(f"Loaded {len(df)} reorder stats for tenant {self.tenant}")
             return df
@@ -221,7 +252,11 @@ class ALSTrainer:
     def build_matrix(self, df: pd.DataFrame):
         """Build interaction matrix from dataframe."""
         try:
-            u_codes, u_uniques = pd.factorize(df["customer_id"].values, sort=True)
+            df = df.copy()
+            df["sales_org_id"] = df["sales_org_id"].astype(str)
+            df["customer_key"] = df["customer_id"].astype(str) + "|" + df["sales_org_id"]
+            
+            u_codes, u_uniques = pd.factorize(df["customer_key"].values, sort=True)
             i_codes, i_uniques = pd.factorize(df["item_id"].values, sort=True)
             
             X = coo_matrix(
@@ -387,7 +422,9 @@ class ALSTrainer:
                                         min_span=1e-4, rank_blend=0.30) -> pd.DataFrame:
         """Normalize ALS scores per user with robust min-max scaling."""
         df = df.copy()
+        df["sales_org_id"] = df["sales_org_id"].astype(str)
         df["als_score_mm"] = 0.0
+        group_cols = ["customer_id", "sales_org_id"]
         
         # Handle backfill recommendations first
         backfill_mask = df["source"] == "backfill"
@@ -398,43 +435,62 @@ class ALSTrainer:
         if not als_mask.any():
             return df
         
-        # Calculate group sizes for each customer
-        customer_counts = df[als_mask]["customer_id"].value_counts()
+        # Calculate group sizes for each customer/sales_org pair
+        counts_df = (
+            df.loc[als_mask, group_cols]
+            .assign(_count=1)
+            .groupby(group_cols)["_count"]
+            .sum()
+            .rename("customer_item_count")
+            .reset_index()
+        )
+        df = df.merge(counts_df, on=group_cols, how="left")
+        df["customer_item_count"] = df["customer_item_count"].fillna(0)
         
         # Handle customers with few items (rank-based normalization)
-        customers_with_few_items = customer_counts[customer_counts < min_items].index
-        few_items_mask = als_mask & df["customer_id"].isin(customers_with_few_items)
+        few_items_mask = als_mask & (df["customer_item_count"] < min_items)
+        denom_few = np.maximum(df.loc[few_items_mask, "customer_item_count"] - 1, 1)
         if few_items_mask.any():
-            df.loc[few_items_mask, "als_score_mm"] = 1.0 - (df.loc[few_items_mask, "als_score_rank"] - 1) / (customer_counts[df.loc[few_items_mask, "customer_id"]] - 1).values
+            df.loc[few_items_mask, "als_score_mm"] = (
+                1.0 - (df.loc[few_items_mask, "als_score_rank"] - 1) / denom_few
+            )
         
         # Handle customers with sufficient items (robust min-max normalization)
-        sufficient_items_mask = als_mask & ~df["customer_id"].isin(customers_with_few_items)
+        sufficient_items_mask = als_mask & ~few_items_mask
         if sufficient_items_mask.any():
-            # Calculate quantiles per customer
-            quantile_df = df[sufficient_items_mask].groupby("customer_id")["als_score_raw"].quantile([lo/100, hi/100]).unstack()
-            quantile_df.columns = ['lo_val', 'hi_val']
-            quantile_df['span'] = quantile_df['hi_val'] - quantile_df['lo_val']
+            quantile_df = (
+                df.loc[sufficient_items_mask]
+                .groupby(group_cols)["als_score_raw"]
+                .quantile([lo / 100, hi / 100])
+                .unstack()
+                .rename(columns={lo / 100: "lo_val", hi / 100: "hi_val"})
+            )
+            quantile_df["span"] = quantile_df["hi_val"] - quantile_df["lo_val"]
             
-            # Merge quantiles back to main dataframe
-            df = df.merge(quantile_df, left_on="customer_id", right_index=True, how="left")
+            df = df.merge(quantile_df, on=group_cols, how="left")
             
-            # Determine normalization strategy
             span_too_small_mask = sufficient_items_mask & (df["span"] < min_span)
-            minmax_mask = sufficient_items_mask & (df["span"] >= min_span)
-            
-            # Handle span too small (rank-based normalization)
             if span_too_small_mask.any():
-                df.loc[span_too_small_mask, "als_score_mm"] = 1.0 - (df.loc[span_too_small_mask, "als_score_rank"] - 1) / (customer_counts[df.loc[span_too_small_mask, "customer_id"]] - 1).values
+                denom_small = np.maximum(df.loc[span_too_small_mask, "customer_item_count"] - 1, 1)
+                df.loc[span_too_small_mask, "als_score_mm"] = (
+                    1.0 - (df.loc[span_too_small_mask, "als_score_rank"] - 1) / denom_small
+                )
             
-            # Handle min-max normalization with rank blending
+            minmax_mask = sufficient_items_mask & (df["span"] >= min_span)
             if minmax_mask.any():
-                minmax_scores = np.clip((df.loc[minmax_mask, "als_score_raw"] - df.loc[minmax_mask, "lo_val"]) / df.loc[minmax_mask, "span"], 0, 1)
-                rank_scores = 1.0 - (df.loc[minmax_mask, "als_score_rank"] - 1) / (customer_counts[df.loc[minmax_mask, "customer_id"]] - 1).values
+                minmax_scores = np.clip(
+                    (df.loc[minmax_mask, "als_score_raw"] - df.loc[minmax_mask, "lo_val"])
+                    / df.loc[minmax_mask, "span"],
+                    0,
+                    1,
+                )
+                denom_minmax = np.maximum(df.loc[minmax_mask, "customer_item_count"] - 1, 1)
+                rank_scores = 1.0 - (df.loc[minmax_mask, "als_score_rank"] - 1) / denom_minmax
                 df.loc[minmax_mask, "als_score_mm"] = (1 - rank_blend) * minmax_scores + rank_blend * rank_scores
             
-            # Clean up temporary columns
-            df = df.drop(columns=['lo_val', 'hi_val', 'span'], errors='ignore')
+            df = df.drop(columns=["lo_val", "hi_val", "span"], errors="ignore")
         
+        df = df.drop(columns=["customer_item_count"], errors="ignore")
         return df
     
     def train_and_export(self):
@@ -448,6 +504,10 @@ class ALSTrainer:
             # Load data
             self.logger.info("Step 1: Loading interaction data...")
             interactions_df = self.load_interactions()
+            interactions_df["sales_org_id"] = interactions_df["sales_org_id"].fillna("-1").astype(str)
+            interactions_df["customer_sales_org_key"] = (
+                interactions_df["customer_id"].astype(str) + "|" + interactions_df["sales_org_id"]
+            )
             
             self.logger.info("Step 2: Loading policy data...")
             policy_df = self.load_policy()
@@ -460,7 +520,10 @@ class ALSTrainer:
             
             # Build interaction matrix
             self.logger.info("Step 5: Building interaction matrix...")
-            X, u_uniques, i_uniques = self.build_matrix(interactions_df)
+            matrix_input_df = interactions_df[["customer_sales_org_key", "item_id", "weight"]].rename(
+                columns={"customer_sales_org_key": "customer_id"}
+            )
+            X, u_uniques, i_uniques = self.build_matrix(matrix_input_df)
             
             # Fit ALS model
             self.logger.info("Step 6: Training ALS model...")
@@ -507,7 +570,10 @@ class ALSTrainer:
             
             # Create arrays for all recommendations at once
             num_recs = len(u_uniques) * actual_topk
-            customer_ids = np.repeat(u_uniques, actual_topk)
+            customer_keys = np.repeat(np.asarray(u_uniques, dtype=str), actual_topk)
+            partitioned_keys = np.char.partition(customer_keys, "|")
+            customer_ids = partitioned_keys[:, 0].astype(np.int64)
+            sales_org_ids = np.where(partitioned_keys[:, 1] == "", "-1", partitioned_keys[:, 2])
             item_ids = i_uniques[top_k_indices.flatten()]
             scores = top_k_scores.flatten()
             ranks = np.tile(np.arange(1, actual_topk + 1), len(u_uniques))
@@ -515,33 +581,40 @@ class ALSTrainer:
             # Create DataFrame directly from arrays
             rec_df = pd.DataFrame({
                 "customer_id": customer_ids,
+                "sales_org_id": sales_org_ids,
                 "item_id": item_ids,
                 "als_score_raw": scores.astype(float),
                 "als_score_rank": ranks,
                 "source": "als"
             })
+            rec_df["sales_org_id"] = rec_df["sales_org_id"].astype(str)
             
             self.logger.info(f"Generated {len(rec_df)} ALS recommendations")
             
             # Add backfill recommendations for customers with few ALS recommendations
             self.logger.info("Step 8: Adding backfill recommendations...")
-            customer_counts = rec_df.groupby("customer_id").size()
-            customers_needing_backfill = customer_counts[customer_counts < 10].index
+            customer_counts = rec_df.groupby(["customer_id", "sales_org_id"]).size()
+            customers_needing_backfill = customer_counts[customer_counts < 10]
             
-            if len(customers_needing_backfill) > 0:
-                self.logger.info(f"Adding backfill recommendations for {len(customers_needing_backfill)} customers")
+            if not customers_needing_backfill.empty:
+                self.logger.info(f"Adding backfill recommendations for {len(customers_needing_backfill)} customer/sales_org pairs")
                 
                 # Get items that are due for reorder
-                due_items = reorder_stats_df[reorder_stats_df.apply(self.is_due, axis=1)]
+                due_items = reorder_stats_df[reorder_stats_df.apply(self.is_due, axis=1)].copy()
+                due_items["sales_org_id"] = due_items["sales_org_id"].astype(str)
                 
                 # Vectorized backfill approach
                 backfill_recs = []
-                for customer_id in customers_needing_backfill:
-                    customer_due_items = due_items[due_items["customer_id"] == customer_id]
+                for (customer_id, sales_org_id), _ in customers_needing_backfill.items():
+                    customer_due_items = due_items[
+                        (due_items["customer_id"] == customer_id) &
+                        (due_items["sales_org_id"] == sales_org_id)
+                    ]
                     if len(customer_due_items) > 0:
                         top_items = customer_due_items.head(10)
                         backfill_recs.append(pd.DataFrame({
                             "customer_id": customer_id,
+                            "sales_org_id": sales_org_id,
                             "item_id": top_items["item_id"].values,
                             "als_score_raw": 0.0,
                             "als_score_rank": 999,
@@ -553,6 +626,7 @@ class ALSTrainer:
                     rec_df = pd.concat([rec_df, backfill_df], ignore_index=True)
                     self.logger.info(f"Added {len(backfill_df)} backfill recommendations")
             
+            # Attach sales organization information
             # Normalize scores per user
             self.logger.info("Step 9: Normalizing scores per user...")
             rec_df = self.per_user_norm_excluding_backfill(rec_df)
@@ -595,67 +669,9 @@ class ALSTrainer:
         """Export recommendations to database using ultra-fast bulk operations."""
         try:
             self.logger.info(f"Exporting {len(rec_df)} recommendations to database for tenant {self.tenant}")
-            
-            # Use larger chunk size for bulk operations
-            bulk_chunk_size = min(50000, len(rec_df))  # Larger chunks for bulk operations
-            successful_chunks = 0
-            failed_chunks = 0
-            total_chunks = (len(rec_df) + bulk_chunk_size - 1) // bulk_chunk_size
-            
-            # Get connection once and reuse
-            conn = self.engine.connect()
-            raw_conn = conn.connection.driver_connection
-            cursor = raw_conn.cursor()
-            
-            try:
-                # Enable fast_executemany and other performance optimizations
-                cursor.fast_executemany = True
-                
-                # Truncate table first
-                cursor.execute("TRUNCATE TABLE NSR.user_rec_als")
-                
-                # Prepare bulk insert SQL
-                insert_sql = """
-                    INSERT INTO NSR.user_rec_als 
-                    (customer_id, item_id, als_score_raw, als_score_mm, als_score_rank, source) 
-                    VALUES (?, ?, ?, ?, ?, ?)
-                """
-                
-                # Process data in large chunks
-                for i in range(0, len(rec_df), bulk_chunk_size):
-                    chunk = rec_df.iloc[i:i + bulk_chunk_size]
-                    chunk_num = i // bulk_chunk_size + 1
-                    
-                    for attempt in range(self.max_retries):
-                        try:
-                            # Prepare data for bulk insert - convert to list of tuples for maximum speed
-                            data = [tuple(row) for row in chunk[["customer_id", "item_id", "als_score_raw", "als_score_mm", "als_score_rank", "source"]].values]
-                            
-                            # Bulk insert with fast_executemany
-                            cursor.executemany(insert_sql, data)
-                            raw_conn.commit()
-                            
-                            self.logger.info(f"Chunk {chunk_num}/{total_chunks} exported successfully ({len(chunk)} rows)")
-                            successful_chunks += 1
-                            break
-                        
-                        except Exception as chunk_error:
-                            if attempt < self.max_retries - 1:
-                                self.logger.warning(f"Chunk {chunk_num} failed (attempt {attempt + 1}/{self.max_retries}): {str(chunk_error)}")
-                                import time
-                                time.sleep(2)  # Shorter retry delay for bulk operations
-                            else:
-                                self.logger.error(f"Chunk {chunk_num} failed after {self.max_retries} attempts")
-                                failed_chunks += 1
-                                raise chunk_error
-                
-                self.logger.info(f"Export completed: {successful_chunks} successful chunks, {failed_chunks} failed chunks")
-                
-            finally:
-                # Clean up connections
-                cursor.close()
-                conn.close()
-            
+            initial_chunk = self.chunk_size if self.chunk_size > 0 else 10000
+            initial_chunk = max(2000, min(initial_chunk, len(rec_df), 20000))
+            self._bulk_insert_with_strategy(rec_df, initial_chunk, min_chunk_size=1000, strategy="bulk")
         except Exception as e:
             self.logger.error(f"Failed to export recommendations for tenant {self.tenant}: {str(e)}")
             raise
@@ -665,42 +681,9 @@ class ALSTrainer:
         try:
             self.logger.info(f"Ultra-fast export: {len(rec_df)} recommendations to database for tenant {self.tenant}")
             
-            # Use SQLAlchemy bulk operations for maximum speed
-            from sqlalchemy import text
-            
-            # Get connection
-            conn = self.engine.connect()
-            raw_conn = conn.connection.driver_connection
-            cursor = raw_conn.cursor()
-            
-            try:
-                # Enable all performance optimizations
-                cursor.fast_executemany = True
-                
-                # Truncate table
-                cursor.execute("TRUNCATE TABLE NSR.user_rec_als")
-                
-                # Prepare bulk insert SQL
-                insert_sql = """
-                    INSERT INTO NSR.user_rec_als 
-                    (customer_id, item_id, als_score_raw, als_score_mm, als_score_rank, source) 
-                    VALUES (?, ?, ?, ?, ?, ?)
-                """
-                
-                # Convert DataFrame to list of tuples for maximum speed
-                data = [tuple(row) for row in rec_df[["customer_id", "item_id", "als_score_raw", "als_score_mm", "als_score_rank", "source"]].values]
-                
-                # Single bulk insert for maximum speed
-                self.logger.info(f"Performing single bulk insert of {len(data)} records...")
-                cursor.executemany(insert_sql, data)
-                raw_conn.commit()
-                
-                self.logger.info(f"Ultra-fast export completed: {len(data)} records inserted successfully")
-                
-            finally:
-                cursor.close()
-                conn.close()
-            
+            initial_chunk = self.chunk_size * 2 if self.chunk_size > 0 else 40000
+            initial_chunk = max(2000, min(initial_chunk, len(rec_df), 50000))
+            self._bulk_insert_with_strategy(rec_df, initial_chunk, min_chunk_size=1500, strategy="ultra-fast")
         except Exception as e:
             self.logger.error(f"Ultra-fast export failed for tenant {self.tenant}: {str(e)}")
             # Fallback to regular export method
@@ -712,71 +695,215 @@ class ALSTrainer:
         try:
             self.logger.info(f"Super-fast export: {len(rec_df)} recommendations to database for tenant {self.tenant}")
             
-            # For very large datasets, use optimized chunking with larger chunks
-            super_chunk_size = 200000  # 200K records per chunk for super-fast operations
-            successful_chunks = 0
-            failed_chunks = 0
-            total_chunks = (len(rec_df) + super_chunk_size - 1) // super_chunk_size
-            
-            # Get connection once and reuse
-            conn = self.engine.connect()
-            raw_conn = conn.connection.driver_connection
-            cursor = raw_conn.cursor()
-            
-            try:
-                # Enable all performance optimizations
-                cursor.fast_executemany = True
-                
-                # Truncate table first
-                cursor.execute("TRUNCATE TABLE NSR.user_rec_als")
-                
-                # Prepare bulk insert SQL
-                insert_sql = """
-                    INSERT INTO NSR.user_rec_als 
-                    (customer_id, item_id, als_score_raw, als_score_mm, als_score_rank, source) 
-                    VALUES (?, ?, ?, ?, ?, ?)
-                """
-                
-                # Process data in super-large chunks for maximum efficiency
-                for i in range(0, len(rec_df), super_chunk_size):
-                    chunk = rec_df.iloc[i:i + super_chunk_size]
-                    chunk_num = i // super_chunk_size + 1
-                    
-                    for attempt in range(self.max_retries):
-                        try:
-                            # Convert to list of tuples for maximum speed
-                            data = [tuple(row) for row in chunk[["customer_id", "item_id", "als_score_raw", "als_score_mm", "als_score_rank", "source"]].values]
-                            
-                            # Bulk insert with fast_executemany
-                            cursor.executemany(insert_sql, data)
-                            raw_conn.commit()
-                            
-                            self.logger.info(f"Super-fast chunk {chunk_num}/{total_chunks} exported successfully ({len(chunk)} rows)")
-                            successful_chunks += 1
-                            break
-                            
-                        except Exception as chunk_error:
-                            if attempt < self.max_retries - 1:
-                                self.logger.warning(f"Super-fast chunk {chunk_num} failed (attempt {attempt + 1}/{self.max_retries}): {str(chunk_error)}")
-                                import time
-                                time.sleep(1)  # Very short retry delay for super-fast operations
-                            else:
-                                self.logger.error(f"Super-fast chunk {chunk_num} failed after {self.max_retries} attempts")
-                                failed_chunks += 1
-                                raise chunk_error
-                
-                self.logger.info(f"Super-fast export completed: {successful_chunks} successful chunks, {failed_chunks} failed chunks")
-                
-            finally:
-                # Clean up connections
-                cursor.close()
-                conn.close()
-            
+            initial_chunk = self.chunk_size * 3 if self.chunk_size > 0 else 75000
+            initial_chunk = max(5000, min(initial_chunk, len(rec_df), 100000))
+            self._bulk_insert_with_strategy(rec_df, initial_chunk, min_chunk_size=2500, strategy="super-fast")
         except Exception as e:
             self.logger.error(f"Super-fast export failed for tenant {self.tenant}: {str(e)}")
             # Fallback to ultra-fast export method
             self.logger.info("Falling back to ultra-fast export method...")
             self._export_to_database_ultra_fast(rec_df)
+
+    def _bulk_insert_with_strategy(
+        self,
+        rec_df: pd.DataFrame,
+        initial_chunk_size: int,
+        min_chunk_size: int,
+        strategy: str,
+    ) -> None:
+        """Common bulk insert implementation with adaptive chunk sizing and retry support."""
+        # Ensure sales_org_id column exists before processing
+        if "sales_org_id" not in rec_df.columns:
+            rec_df = rec_df.copy()
+            rec_df["sales_org_id"] = "-1"
+        else:
+            rec_df = rec_df.copy()
+            rec_df["sales_org_id"] = rec_df["sales_org_id"].fillna("-1").astype(str)
+
+        columns = [
+            "customer_id",
+            "item_id",
+            "als_score_raw",
+            "als_score_mm",
+            "als_score_rank",
+            "source",
+            "sales_org_id",
+        ]
+        dtype_map = {
+            "customer_id": "int64",
+            "item_id": "int64",
+            "als_score_raw": "float64",
+            "als_score_mm": "float64",
+            "als_score_rank": "float64",
+        }
+
+        min_chunk_size = max(500, min_chunk_size)
+        total_rows = len(rec_df)
+        chunk_size = max(min_chunk_size, min(initial_chunk_size, total_rows)) if total_rows else min_chunk_size
+
+        insert_sql = """
+            INSERT INTO NSR.user_rec_als
+            (customer_id, item_id, als_score_raw, als_score_mm, als_score_rank, source, sales_org_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """
+
+        conn = None
+        cursor = None
+        inserted_rows = 0
+        successful_chunks = 0
+        failed_chunks = 0
+        start_time = time.time()
+
+        try:
+            conn = self.engine.raw_connection()
+            raw_conn = conn
+            raw_conn.autocommit = False
+            cursor = raw_conn.cursor()
+
+            # Enable driver optimisations when available
+            if hasattr(cursor, "fast_executemany"):
+                cursor.fast_executemany = True
+            if hasattr(cursor, "timeout") and self.command_timeout:
+                try:
+                    cursor.timeout = self.command_timeout
+                except Exception:
+                    pass
+            if hasattr(cursor, "arraysize"):
+                cursor.arraysize = chunk_size
+
+            # Always truncate before inserting new recommendations
+            cursor.execute("TRUNCATE TABLE NSR.user_rec_als")
+            raw_conn.commit()
+
+            if total_rows == 0:
+                self.logger.info(f"{strategy.capitalize()} export: no rows to insert after truncate.")
+                return
+
+            position = 0
+            chunk_index = 0
+
+            while position < total_rows:
+                remaining = total_rows - position
+                current_chunk_size = min(chunk_size, remaining)
+                chunk = rec_df.iloc[position: position + current_chunk_size].copy()
+
+                if "sales_org_id" in chunk.columns:
+                    chunk["sales_org_id"] = chunk["sales_org_id"].fillna("-1").astype(str)
+                else:
+                    chunk["sales_org_id"] = "-1"
+
+                for col, dtype in dtype_map.items():
+                    chunk[col] = chunk[col].astype(dtype, copy=False)
+                chunk["source"] = chunk["source"].astype(str)
+
+                attempts = 0
+                backoff_seconds = 1.0
+
+                while attempts < self.max_retries:
+                    rows = [tuple(row) for row in chunk[columns].itertuples(index=False, name=None)]
+                    chunk_label = chunk_index + 1
+
+                    try:
+                        begin = time.time()
+                        self.logger.debug(
+                            "%s chunk %s: inserting %s rows (position %s)",
+                            strategy,
+                            chunk_label,
+                            len(rows),
+                            position,
+                        )
+
+                        cursor.executemany(insert_sql, rows)
+                        raw_conn.commit()
+
+                        duration = time.time() - begin
+                        inserted_rows += len(rows)
+                        chunk_index += 1
+                        successful_chunks += 1
+
+                        self.logger.info(
+                            "%s chunk %s committed (%s rows in %.2fs, cumulative %s/%s)",
+                            strategy.capitalize(),
+                            chunk_label,
+                            len(rows),
+                            duration,
+                            inserted_rows,
+                            total_rows,
+                        )
+
+                        position += len(rows)
+                        break
+
+                    except Exception as chunk_error:
+                        raw_conn.rollback()
+                        attempts += 1
+
+                        self.logger.warning(
+                            "%s chunk %s failed on attempt %s/%s with chunk_size=%s: %s",
+                            strategy.capitalize(),
+                            chunk_label,
+                            attempts,
+                            self.max_retries,
+                            len(rows),
+                            chunk_error,
+                        )
+
+                        # Reduce chunk size to alleviate pressure if possible
+                        if chunk_size > min_chunk_size and len(rows) > min_chunk_size:
+                            old_chunk_size = chunk_size
+                            chunk_size = max(min_chunk_size, chunk_size // 2)
+                            self.logger.info(
+                                "%s chunk size reduced from %s to %s rows due to failure; retrying same position %s",
+                                strategy.capitalize(),
+                                old_chunk_size,
+                                chunk_size,
+                                position,
+                            )
+                            current_chunk_size = min(chunk_size, remaining)
+                            chunk = rec_df.iloc[position: position + current_chunk_size].copy()
+                            if "sales_org_id" in chunk.columns:
+                                chunk["sales_org_id"] = chunk["sales_org_id"].fillna("-1").astype(str)
+                            else:
+                                chunk["sales_org_id"] = "-1"
+                            for col, dtype in dtype_map.items():
+                                chunk[col] = chunk[col].astype(dtype, copy=False)
+                            chunk["source"] = chunk["source"].astype(str)
+                            backoff_seconds = 1.0
+                            # continue with smaller chunk without increasing attempts counter
+                            continue
+
+                        if attempts < self.max_retries:
+                            sleep_time = min(5.0, backoff_seconds)
+                            self.logger.info(
+                                "Retrying %s chunk %s in %.1fs...",
+                                strategy,
+                                chunk_label,
+                                sleep_time,
+                            )
+                            time.sleep(sleep_time)
+                            backoff_seconds = min(5.0, backoff_seconds * 2)
+                        else:
+                            failed_chunks += 1
+                            raise
+
+            raw_conn.commit()
+
+            elapsed = time.time() - start_time
+            self.logger.info(
+                "%s export completed: %s rows inserted in %.2fs (successful chunks=%s, failed chunks=%s, final chunk size=%s).",
+                strategy.capitalize(),
+                inserted_rows,
+                elapsed,
+                successful_chunks,
+                failed_chunks,
+                chunk_size,
+            )
+
+        finally:
+            if cursor is not None:
+                cursor.close()
+            if conn is not None:
+                conn.close()
 
     def _export_to_database_bulk_insert(self, rec_df: pd.DataFrame):
         """Ultimate performance: BULK INSERT using temporary CSV file for millions of records."""
@@ -791,7 +918,7 @@ class ALSTrainer:
                 temp_filename = temp_file.name
                 
                 # Write CSV data directly to file
-                rec_df[["customer_id", "item_id", "als_score_raw", "als_score_mm", "als_score_rank", "source"]].to_csv(
+                rec_df[["customer_id", "item_id", "als_score_raw", "als_score_mm", "als_score_rank", "source", "sales_org_id"]].to_csv(
                     temp_file, 
                     index=False, 
                     header=False,

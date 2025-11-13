@@ -65,5 +65,15 @@ def get_logging_config(profile: str = "default") -> dict:
     else:
         return {"level": "INFO", "format": "json"}
 
+
+def should_clean_logs_on_run() -> bool:
+    """Determine if logs should be cleaned before each run."""
+    config = _load_config()
+    logging_config = config.get('logging', {})
+    if isinstance(logging_config, dict):
+        return bool(logging_config.get('clean_logs_on_run', False))
+    return False
+
+
 def get_tenant_config_sync(tenant: str) -> Optional[TenantConfig]:
     return get_tenant_config_from_cache_only(tenant)
