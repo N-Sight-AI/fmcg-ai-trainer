@@ -253,10 +253,9 @@ class ALSTrainer:
         """Build interaction matrix from dataframe."""
         try:
             df = df.copy()
-            df["sales_org_id"] = df["sales_org_id"].astype(str)
-            df["customer_key"] = df["customer_id"].astype(str) + "|" + df["sales_org_id"]
+            df["customer_id"] = df["customer_id"].astype(str)
             
-            u_codes, u_uniques = pd.factorize(df["customer_key"].values, sort=True)
+            u_codes, u_uniques = pd.factorize(df["customer_id"].values, sort=True)
             i_codes, i_uniques = pd.factorize(df["item_id"].values, sort=True)
             
             X = coo_matrix(
